@@ -91,7 +91,7 @@ scripts/race.sh <name> avoid:=true           #   ... and pass obstacles the map 
 ```
 
 To drive the mapping laps by hand instead, run `scripts/map_track.sh <name>`, drive 1-2 clean laps with
-`ros2 run autodrive_bridge teleop_keyboard` (W/S speed, A/D steer, X stop) in another shell, stop the
+`ros2 run autodrive_bridge teleop_keyboard` (hold W/S speed, hold A/D steer, X stop) in another shell, stop the
 car and press Enter.
 
 Check `tracks/<name>/preview.png` before racing. To re-plan an existing map (for example after changing

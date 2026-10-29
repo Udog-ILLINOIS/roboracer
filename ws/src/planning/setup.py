@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'build_raceline = planning.build_raceline:main',
             'obstacle_spliner_node = planning.obstacle_spliner_node:main',
+            'plan_segment = planning.plan_segment:main',
         ],
     },
 )
