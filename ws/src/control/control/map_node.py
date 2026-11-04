@@ -16,7 +16,7 @@ from perception.tracks import track_dir
 from .map_guidance import Trajectory,l1_acceleration
 from .map_lut import Lookup
 from .input_health import InputHealth
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 
 class MAP(Node):
     def __init__(self):
@@ -41,8 +41,7 @@ class MAP(Node):
             recovery_seconds=p('recovery_seconds',.25).value,
             recovery_samples=p('recovery_samples',3).value,
             heading_tolerance=p('heading_consistency_tolerance',.25).value,
-            clock_tolerance=p('clock_jump_tolerance',.25).value,
-            reseed_seconds=p('heading_reseed_seconds',1.).value)
+            clock_tolerance=p('clock_jump_tolerance',.25).value)
         self.lock=p('max_steering_angle',Parameter.Type.DOUBLE).value
         self.wheelbase=p('wheelbase',Parameter.Type.DOUBLE).value
         hz=p('update_rate',40.).value
@@ -62,7 +61,7 @@ class MAP(Node):
         path=p('raceline_path','').value or os.path.join(track_dir(p('track','').value),'raceline.csv')
         self.trajectory=Trajectory(np.loadtxt(path,delimiter=';',ndmin=2),p('max_segment',1.).value,p('search_window',2.).value,p('reacquire_distance',1.).value)
         self.pose=None; self.odom=None; self.last_xy=None; self.last_stamp=None; self.last_steer=0.; self.last_command_time=None
-        self.still_xy=None; self.still_since=None
+        self.last_xy_time=None
         self.last_steer_time=time.monotonic(); self.odom_received=None
         self.pub=self.create_publisher(AckermannDriveStamped,'/drive',10)
         self.create_subscription(PoseStamped,p('pose_topic','/localized_pose').value,self.on_pose,10)
@@ -70,13 +69,22 @@ class MAP(Node):
         reset_topic=p('sim_reset_topic','/autodrive/roboracer_1/sim_reset').value
         if reset_topic:
             self.create_subscription(String,reset_topic,lambda msg:self.reset(),10)
+        # The time-reversal and heading latches clear only on a sim reset or this explicit re-arm (e.g. on
+        # hardware after the localizer has been checked): `ros2 topic pub --once /map_node/rearm std_msgs/msg/Empty`
+        rearm_topic=p('rearm_topic','/map_node/rearm').value
+        if rearm_topic:
+            self.create_subscription(Empty,rearm_topic,lambda msg:self.rearm(),10)
         self.create_timer(1/hz,self.tick)
 
     def reset(self):
         self.trajectory.reset(); self.last_xy=None; self.last_stamp=None; self.last_steer=0.; self.last_command_time=None
-        self.still_xy=None; self.still_since=None
+        self.last_xy_time=None
         self.last_steer_time=time.monotonic(); self.odom_received=None; self.health.reset()
         self.pose=None; self.odom=None
+
+    def rearm(self):
+        self.get_logger().warning('MAP re-armed by request: latches cleared, recovery wait follows')
+        self.reset()
 
     def on_pose(self,msg): self.pose=msg
     def on_odom(self,msg):
@@ -95,27 +103,6 @@ class MAP(Node):
         self.publish(0.,self.last_steer)
         self.last_steer_time=time.monotonic()
         if invalidate: self.health.fault()
-
-    def standstill(self,x,y,speed,steady_now):
-        """True once wheel speed AND the pose position have both been still for heading_reseed_seconds.
-
-        Wheel odometry alone is not enough (in the recorded hairpin it read 0.03 m/s at 1 m/s), so the
-        localizer's position must agree. Only then may the pose-jump, heading and time-reversal latches
-        take the current pose as their new reference (e.g. after the localizer relocated a stopped car).
-        """
-        if abs(speed)>=.1:
-            self.still_xy=self.still_since=None
-            return False
-        if self.still_xy is None or math.hypot(x-self.still_xy[0],y-self.still_xy[1])>.05:
-            self.still_xy=(x,y); self.still_since=steady_now
-            return False
-        return steady_now-self.still_since>=self.health.reseed_seconds
-
-    def heading_plausible(self,x,y,yaw):
-        # A re-seeded heading must also follow the raceline near the car: never adopt a reversed or
-        # sideways heading (the hairpin's 119 deg error) just because it is steady.
-        i=int(np.argmin(np.linalg.norm(self.trajectory.xy-[x,y],axis=1)))
-        return math.cos(yaw-self.trajectory.heading[i])>math.cos(1.)
 
     def tick(self):
         start=time.perf_counter()
@@ -145,17 +132,18 @@ class MAP(Node):
         speed=odom.twist.twist.linear.x
         if not np.isfinite([x,y,speed,*quat]).all() or abs(np.linalg.norm(quat)-1)>.05 or speed<-self.reverse_tolerance:
             return self.stop('nonfinite or invalid state')
-        still=self.standstill(x,y,speed,steady_now)
         if self.last_stamp is not None and (ps<self.last_stamp or (self.last_command_time is not None and now<self.last_command_time)):
-            if not still: return self.stop('time reversal')
-            self.last_stamp=self.last_command_time=None  # time source restarted while stopped: new reference
-            return self.stop('time reference reset at standstill, waiting for recovery')
-        if self.last_xy is not None and math.hypot(x-self.last_xy[0],y-self.last_xy[1])>self.max_jump:
-            if not still: return self.stop('implausible pose jump')
-            self.last_xy=(x,y)  # relocated while stopped: the steady pose is the new reference
-            return self.stop('pose re-anchored at standstill, waiting for recovery')
+            return self.stop('time reversal')
+        # Jump check against the last validated pose, allowing for the travel possible since then
+        # (after a stop, dropout or recovery wait the car may have moved on): only a physically
+        # implausible step stops the car; it is accepted once enough time has passed to have travelled it.
+        if self.last_xy is not None:
+            dt=max(0.,steady_now-self.last_xy_time)
+            if math.hypot(x-self.last_xy[0],y-self.last_xy[1])>self.max_jump+(abs(speed)+1.)*dt:
+                return self.stop('implausible pose jump')
+        self.last_xy=(x,y); self.last_xy_time=steady_now
         yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
-        rejection=self.health.accept(yaw,(ps,os_),steady_now,stationary=still and self.heading_plausible(x,y,yaw))
+        rejection=self.health.accept(yaw,(ps,os_),steady_now)
         if rejection: return self.stop(rejection,invalidate=False)
         # Use the local waypoint for lookahead, then the target waypoint for commanded speed.
         closest=self.trajectory.closest
@@ -173,7 +161,7 @@ class MAP(Node):
         steering_dt=max(0.,min(steady_now-self.last_steer_time,.1))
         steer=float(np.clip(steer,self.last_steer-self.rate*steering_dt,self.last_steer+self.rate*steering_dt))
         self.publish(command_v,steer)
-        self.last_steer=steer; self.last_steer_time=steady_now; self.last_command_time=now; self.last_stamp=ps; self.last_xy=(x,y)
+        self.last_steer=steer; self.last_steer_time=steady_now; self.last_command_time=now; self.last_stamp=ps
         self.get_logger().info(f'MAP v={speed:.2f} cmd={command_v:.2f} target={target} L={lookahead:.2f} a={accel:.2f} steer={steer:.3f} error={error:.2f} low_speed={speed<self.lut.speeds[0]} clamp={clamped} saturation={saturated} column={column}',throttle_duration_sec=1.)
 
 def main():
