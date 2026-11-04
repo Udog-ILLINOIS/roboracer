@@ -101,7 +101,11 @@ def save_bundle(out, grid, trajectory, serialize, extract=None, runtime=None):
     stage = Path(tempfile.mkdtemp(prefix=f'.{out.name}-saving-', dir=out.parent))
     try:
         (stage / 'live').mkdir()
-        write_grid(stage / 'live', grid)   # the live /map, only to compare with the graph raster
+        try:   # the live /map, only to compare with the graph raster: never a reason to fail the save
+            write_grid(stage / 'live', grid)
+            live_error = None
+        except RuntimeError as error:
+            live_error = str(error)
         write_trajectory(stage, trajectory)
         (stage / 'trajectory.csv').rename(stage / 'trajectory_online.csv')
         serialize(str(stage / 'map'))
@@ -119,8 +123,9 @@ def save_bundle(out, grid, trajectory, serialize, extract=None, runtime=None):
         if (report['final']['motion']['samples'] < 11
                 or report['online_to_final']['unmatched_online']):
             raise RuntimeError('serialized graph does not cover this mapping trajectory')
-        report['graph_raster_comparison'] = {'live_map_vs_graph': True,
-                                             **compare_rasters(stage / 'live' / 'map.yaml', stage / 'map.yaml')}
+        report['graph_raster_comparison'] = (
+            {'live_map_vs_graph': True, **compare_rasters(stage / 'live' / 'map.yaml', stage / 'map.yaml')}
+            if live_error is None else {'live_map_vs_graph': False, 'reason': live_error})
         shutil.rmtree(stage / 'live')
         report['runtime'] = runtime
         (stage / 'mapping_diagnostics.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
