@@ -5,6 +5,7 @@ import os
 import time
 import numpy as np
 import rclpy
+from rclpy.signals import SignalHandlerOptions
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -32,16 +33,21 @@ class MAP(Node):
         self.max_offset=p('max_offset',3.).value
         self.max_jump=p('max_pose_jump',2.).value
         self.rate=p('steering_rate_limit',3.2).value
+        # Command at most lut top - margin; measured speed may overshoot the top column by up to overshoot.
+        self.lut_margin=p('lut_speed_margin',.3).value
+        self.lut_overshoot=p('lut_speed_overshoot',.5).value
+        self.reverse_tolerance=p('reverse_speed_tolerance',.05).value
         self.health=InputHealth(
             recovery_seconds=p('recovery_seconds',.25).value,
             recovery_samples=p('recovery_samples',3).value,
             heading_tolerance=p('heading_consistency_tolerance',.25).value,
-            clock_tolerance=p('clock_jump_tolerance',.25).value)
+            clock_tolerance=p('clock_jump_tolerance',.25).value,
+            reseed_seconds=p('heading_reseed_seconds',1.).value)
         self.lock=p('max_steering_angle',Parameter.Type.DOUBLE).value
         self.wheelbase=p('wheelbase',Parameter.Type.DOUBLE).value
         hz=p('update_rate',40.).value
-        numeric=[self.speed_scale,self.max_speed,self.slope,self.offset,self.lmin,self.lmax,self.pose_timeout,self.odom_timeout,self.max_offset,self.max_jump,self.rate,hz,self.lock,self.wheelbase]
-        if any(v is None or not isinstance(v,(int,float)) or not math.isfinite(v) for v in numeric) or min(self.speed_scale,self.lmin,self.pose_timeout,self.odom_timeout,self.max_offset,self.max_jump,self.rate,hz,self.lock,self.wheelbase)<=0 or self.lmax<self.lmin or self.max_speed<0:
+        numeric=[self.speed_scale,self.max_speed,self.slope,self.offset,self.lmin,self.lmax,self.pose_timeout,self.odom_timeout,self.max_offset,self.max_jump,self.rate,hz,self.lock,self.wheelbase,self.lut_margin,self.lut_overshoot,self.reverse_tolerance]
+        if any(v is None or not isinstance(v,(int,float)) or not math.isfinite(v) for v in numeric) or min(self.speed_scale,self.lmin,self.pose_timeout,self.odom_timeout,self.max_offset,self.max_jump,self.rate,hz,self.lock,self.wheelbase)<=0 or self.lmax<self.lmin or self.max_speed<0 or min(self.lut_margin,self.lut_overshoot,self.reverse_tolerance)<0:
             raise ValueError('invalid MAP configuration or missing vehicle.yaml')
         share=get_package_share_directory('control')
         model_path=p('model_path',os.path.join(share,'config','map_model.json')).value
@@ -50,6 +56,8 @@ class MAP(Node):
         if model['model'] not in ('linear','pacejka') or abs(model['lf']+model['lr']-self.wheelbase)>1e-6:
             raise ValueError('model/wheelbase mismatch')
         self.lut=Lookup(lut_path,model)
+        self.v_cap=float(self.lut.speeds[-1])-self.lut_margin
+        if self.v_cap<=self.lut.speeds[0]: raise ValueError('lut_speed_margin leaves no usable LUT speed range')
         path=p('raceline_path','').value or os.path.join(track_dir(p('track','').value),'raceline.csv')
         self.trajectory=Trajectory(np.loadtxt(path,delimiter=';',ndmin=2),p('max_segment',1.).value,p('search_window',2.).value,p('reacquire_distance',1.).value)
         self.pose=None; self.odom=None; self.last_xy=None; self.last_stamp=None; self.last_steer=0.; self.last_command_time=None
@@ -83,7 +91,11 @@ class MAP(Node):
         # Brake while retaining steering, and retain the slew reference on resume.
         self.publish(0.,self.last_steer)
         self.last_steer_time=time.monotonic()
-        if invalidate: self.health.fault()
+        if invalidate:
+            self.health.fault()
+            # The jump check compares against the last commanded pose; after a stop the car may have
+            # rolled on or been relocated, so the next fresh pose (after the recovery wait) is the reference.
+            self.last_xy=None
         if reset: self.reset()
 
     def tick(self):
@@ -114,22 +126,22 @@ class MAP(Node):
         q=pose.pose.orientation
         quat=np.array([q.x,q.y,q.z,q.w]); x=pose.pose.position.x; y=pose.pose.position.y
         speed=odom.twist.twist.linear.x
-        if not np.isfinite([x,y,speed,*quat]).all() or abs(np.linalg.norm(quat)-1)>.05 or speed<0:
+        if not np.isfinite([x,y,speed,*quat]).all() or abs(np.linalg.norm(quat)-1)>.05 or speed<-self.reverse_tolerance:
             return self.stop('nonfinite or invalid state')
         if self.last_xy is not None and math.hypot(x-self.last_xy[0],y-self.last_xy[1])>self.max_jump:
             return self.stop('implausible pose jump')
         yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
-        rejection=self.health.accept(yaw,(ps,os_),steady_now)
+        rejection=self.health.accept(yaw,(ps,os_),steady_now,stationary=abs(speed)<.1)
         if rejection: return self.stop(rejection,invalidate=False)
         # Use the local waypoint for lookahead, then the target waypoint for commanded speed.
         closest=self.trajectory.closest
         local_v=self.trajectory.rows[closest,5] if closest is not None else self.trajectory.rows[0,5]
-        command_v=min(local_v*self.speed_scale,self.max_speed if self.max_speed>0 else float('inf'),self.lut.speeds[-1])
+        command_v=min(local_v*self.speed_scale,self.max_speed if self.max_speed>0 else float('inf'),self.v_cap)
         lookahead=float(np.clip(self.slope*command_v+self.offset,self.lmin,self.lmax))
         target,distance,eta,error=self.trajectory.target(x,y,yaw,lookahead,self.max_offset)
-        command_v=min(self.trajectory.rows[target,5]*self.speed_scale,self.max_speed if self.max_speed>0 else float('inf'),self.lut.speeds[-1])
-        effective=max(speed,self.lut.speeds[0])
-        if speed>self.lut.speeds[-1]: return self.stop('measured speed exceeds LUT')
+        command_v=min(self.trajectory.rows[target,5]*self.speed_scale,self.max_speed if self.max_speed>0 else float('inf'),self.v_cap)
+        if speed>self.lut.speeds[-1]+self.lut_overshoot: return self.stop('measured speed exceeds LUT')
+        effective=float(np.clip(speed,self.lut.speeds[0],self.lut.speeds[-1]))
         accel=l1_acceleration(effective,eta,distance)
         steer,clamped,column=self.lut.query(accel,effective)
         saturated=abs(steer)>self.lock
@@ -141,14 +153,17 @@ class MAP(Node):
         self.get_logger().info(f'MAP v={speed:.2f} cmd={command_v:.2f} target={target} L={lookahead:.2f} a={accel:.2f} steer={steer:.3f} error={error:.2f} low_speed={speed<self.lut.speeds[0]} clamp={clamped} saturation={saturated} column={column}',throttle_duration_sec=1.)
 
 def main():
-    rclpy.init()
+    # Handle Ctrl+C ourselves (as pure_pursuit_node): rclpy's default handler shuts ROS down first,
+    # so the final stop could never be published.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node=MAP()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node,timeout_sec=.1)
     except KeyboardInterrupt:
         pass
-    finally:
-        if rclpy.ok():
-            node.publish()
-        node.destroy_node()
-        rclpy.try_shutdown()
+    for _ in range(10):  # 0.5 s of stops so the adapter brakes
+        node.publish(0.,node.last_steer)
+        time.sleep(.05)
+    node.destroy_node()
+    rclpy.try_shutdown()

@@ -52,6 +52,16 @@ def controller_launch(context, include):
     raise ValueError('controller must be pure_pursuit or map')
 
 
+def check_controller(context):
+    # Before the localizer includes, so a bad combination aborts before anything starts.
+    controller = LaunchConfiguration('controller').perform(context)
+    if controller not in ('pure_pursuit', 'map'):
+        raise ValueError('controller must be pure_pursuit or map')
+    if controller == 'map' and LaunchConfiguration('avoid').perform(context).lower() in ('true', '1'):
+        raise ValueError('MAP does not support avoid:=true')
+    return []
+
+
 def generate_launch_description():
     def include(package, launch_file, args, condition=None):
         return IncludeLaunchDescription(
@@ -79,6 +89,7 @@ def generate_launch_description():
                               description='with adaptive_lookahead: corner cut [m], lookahead <= sqrt(2 cut / kappa)'),
         DeclareLaunchArgument('adaptive_lookahead_min_time', default_value='0.25',
                               description='with adaptive_lookahead: but lookahead >= min_time x speed [s]'),
+        OpaqueFunction(function=check_controller),
         include('perception', 'localization.launch.py', ['track'], UnlessCondition(use_mcl)),
         include('perception', 'mcl.launch.py', ['track'], IfCondition(use_mcl)),
         OpaqueFunction(function=lambda context: controller_launch(context, include)),
