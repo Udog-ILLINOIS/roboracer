@@ -76,37 +76,3 @@ def test_recorded_hairpin_clock_and_heading_error_stays_stopped():
     bad_yaw=physical_turn+math.radians(-118.77)
     assert guard.accept(bad_yaw,(12.89335,12.89335),.4+dt) is not None
     assert guard.recovering
-
-
-def test_relocated_heading_reseeds_only_at_standstill_after_consistent_poses():
-    # A localizer relocates a stopped car by 1 rad: once that heading has held for
-    # reseed_seconds it becomes the reference, then the normal recovery wait applies.
-    guard=InputHealth()
-    arm(guard)
-    results=[]
-    for i in range(40):
-        t=.5+i*.05
-        guard.advance(10+t,t,0.,True)
-        results.append(guard.accept(1.,(10+t,10+t),t,stationary=True))
-    assert results[0] is not None
-    assert 'heading re-seeded' in ' '.join(r or '' for r in results)
-    assert results[-1] is None
-
-
-def test_wrong_heading_never_reseeds_while_moving():
-    guard=InputHealth()
-    arm(guard)
-    for i in range(60):
-        t=.5+i*.05
-        guard.advance(10+t,t,0.,True)
-        assert guard.accept(1.,(10+t,10+t),t,stationary=False) is not None
-
-
-def test_unstable_heading_at_standstill_does_not_reseed():
-    guard=InputHealth()
-    arm(guard)
-    for i in range(60):
-        t=.5+i*.05
-        guard.advance(10+t,t,0.,True)
-        yaw=1. if i%2 else -1.   # jumping between two wrong headings
-        assert guard.accept(yaw,(10+t,10+t),t,stationary=True) is not None

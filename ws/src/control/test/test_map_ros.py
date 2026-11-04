@@ -12,6 +12,7 @@ rclpy = pytest.importorskip('rclpy')
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Empty
 from rclpy.executors import SingleThreadedExecutor
 from launch import LaunchContext
 
@@ -42,6 +43,7 @@ def test_map_ros_commands_stops_and_recovers():
         executor.add_node(tester)
         poses = tester.create_publisher(PoseStamped, '/map_test_pose', 10)
         odoms = tester.create_publisher(Odometry, '/map_test_odom', 10)
+        rearm = tester.create_publisher(Empty, '/map_node/rearm', 10)
         drives = []
         tester.create_subscription(AckermannDriveStamped, '/drive', drives.append, 10)
 
@@ -99,12 +101,12 @@ def test_map_ros_commands_stops_and_recovers():
             assert drives[-1].drive.speed == 0  # no immediate re-arm on one fresh pose
             publish()
             assert drives[-1].drive.speed > 0
-            # Relocated to the far side of the circle (4 m jump, heading reversed): while the wheels
-            # report motion the latches hold, however long the new pose is steady ...
-            publish(x=-2., yaw=-math.pi/2, speed=1., duration=2.6)
-            assert max(d.drive.speed for d in drives[-40:]) == 0
-            # ... and at a confirmed standstill (wheels + pose still) the pose becomes the new reference.
-            publish(x=-2., yaw=-math.pi/2, speed=0., duration=3.5)
+            # A wrong heading at standstill stays latched ...
+            publish(yaw=math.pi/2+2., speed=0., duration=1.5)
+            assert max(d.drive.speed for d in drives[-50:]) == 0
+            # ... until an explicit re-arm (then the recovery wait) with a correct pose.
+            rearm.publish(Empty())
+            publish(duration=.6)
             assert drives[-1].drive.speed > 0
         finally:
             executor.remove_node(tester)
