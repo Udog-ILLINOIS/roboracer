@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>slam_graph_tools</name>
+  <version>0.1.0</version>
+  <description>Offline read-only SLAM Toolbox graph snapshot export for mapping.</description>
+  <maintainer email="rkhanna8@illinois.edu">SIGRobotics</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>slam_toolbox</depend>
+  <depend>rclcpp</depend>
+  <depend>boost</depend>
+  <depend>libtbb-dev</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
