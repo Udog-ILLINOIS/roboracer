@@ -168,7 +168,8 @@ def test_bundle_published_only_after_graph_pair_validated(tmp_path):
     assert len((out / 'trajectory.csv').read_text().splitlines()) == 13
     # the live /map is compared with the graph raster (not the saved raster with itself), then dropped
     comparison = json.loads((out / 'mapping_diagnostics.json').read_text())['graph_raster_comparison']
-    assert comparison['live_map_vs_graph'] and comparison['geometry_matches'] is not None
+    assert comparison['live_map_vs_graph'] is True
+    assert comparison['geometry_matches'] in (True, False) and 'different_pixels' in comparison
     assert not (out / 'live').exists()
     assert oct((out).stat().st_mode & 0o777) == oct(0o755)
     original = (out / 'map.pgm').read_bytes()
@@ -255,3 +256,14 @@ def test_serialization_errors_are_not_success(monkeypatch, mode):
     monkeypatch.setattr(rclpy, 'spin_until_future_complete', lambda *args, **kwargs: None)
     with pytest.raises(RuntimeError): SaveSlamMap.serialize(fake, '/tmp/prefix')
     assert destroyed == [client]
+
+
+def test_an_unusable_live_map_does_not_fail_a_graph_save(tmp_path):
+    # map.pgm/map.yaml come from the graph snapshot; the live /map is only compared with it
+    live = grid()
+    live.info.resolution = .1
+    out = tmp_path / 'new'
+    save_bundle(out, live, trajectory(), serializer)
+    validate_artifacts(out)
+    comparison = json.loads((out / 'mapping_diagnostics.json').read_text())['graph_raster_comparison']
+    assert comparison['live_map_vs_graph'] is False and 'resolution' in comparison['reason']

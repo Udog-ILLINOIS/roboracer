@@ -1,11 +1,7 @@
 """Clock/heading consistency and recovery latch, independent of ROS.
 
 Heading is propagated with fresh measured yaw rate on monotonic time while input
-poses are rejected. Stable but wrong poses cannot re-arm just by being repeated while
-the car moves. When the caller confirms a standstill (map_node: wheel speed and pose
-position both still for reseed_seconds, and the heading follows the raceline), a pose
-heading that then stays self-consistent for reseed_seconds becomes the new reference and
-goes through the normal recovery wait; otherwise the latch would never clear.
+poses are rejected. Stable but wrong poses cannot re-arm just by being repeated.
 """
 import math
 
@@ -16,16 +12,15 @@ def angle_delta(a, b):
 
 class InputHealth:
     def __init__(self, recovery_seconds=.25, recovery_samples=3,
-                 heading_tolerance=.25, clock_tolerance=.25, reseed_seconds=1.):
+                 heading_tolerance=.25, clock_tolerance=.25):
         if (not all(math.isfinite(v) and v > 0 for v in
-                    (recovery_seconds, recovery_samples, heading_tolerance, clock_tolerance, reseed_seconds)) or
+                    (recovery_seconds, recovery_samples, heading_tolerance, clock_tolerance)) or
                 int(recovery_samples) != recovery_samples):
             raise ValueError('invalid input recovery configuration')
         self.recovery_seconds = recovery_seconds
         self.recovery_samples = recovery_samples
         self.heading_tolerance = heading_tolerance
         self.clock_tolerance = clock_tolerance
-        self.reseed_seconds = reseed_seconds
         self.reset()
 
     def reset(self):
@@ -35,8 +30,6 @@ class InputHealth:
         self.valid_since = None
         self.valid_count = 0
         self.last_pair = None
-        self.candidate_yaw = None
-        self.candidate_since = None
 
     def fault(self):
         self.recovering = True
@@ -57,22 +50,12 @@ class InputHealth:
         self.last_clock = (ros_now, monotonic_now)
         return reason
 
-    def accept(self, yaw, pair, monotonic_now, stationary=False):
+    def accept(self, yaw, pair, monotonic_now):
         if self.expected_yaw is None:
             self.expected_yaw = yaw
-        if abs(angle_delta(yaw,self.expected_yaw)) > self.heading_tolerance:
+        if self.expected_yaw is not None and abs(angle_delta(yaw,self.expected_yaw)) > self.heading_tolerance:
             self.fault()
-            if not stationary:
-                self.candidate_yaw = self.candidate_since = None
-            elif (self.candidate_yaw is None or
-                    abs(angle_delta(yaw,self.candidate_yaw)) > self.heading_tolerance):
-                self.candidate_yaw, self.candidate_since = yaw, monotonic_now
-            elif monotonic_now-self.candidate_since >= self.reseed_seconds:
-                self.expected_yaw = yaw
-                self.candidate_yaw = self.candidate_since = None
-                return 'heading re-seeded at standstill, waiting for recovery'
             return 'heading inconsistent with yaw-rate propagation'
-        self.candidate_yaw = self.candidate_since = None
         if self.recovering:
             if self.valid_since is None:
                 self.valid_since = monotonic_now
