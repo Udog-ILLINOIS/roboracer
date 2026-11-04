@@ -46,19 +46,6 @@ def obstacle_spliner(context):
     }])]
 
 
-def controller_launch(context, include):
-    controller = LaunchConfiguration('controller').perform(context)
-    if controller == 'pure_pursuit':
-        return [include('control', 'pure_pursuit.launch.py', [
-            'track', 'pose_topic', 'speed_scale', 'max_speed', 'avoid',
-            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time'])]
-    if controller == 'map':
-        if LaunchConfiguration('avoid').perform(context).lower() in ('true', '1'):
-            raise ValueError('MAP does not support avoid:=true')
-        return [include('control', 'map.launch.py', ['track', 'pose_topic', 'speed_scale', 'max_speed'])]
-    raise ValueError('controller must be pure_pursuit or map')
-
-
 def check_controller(context):
     # Before the localizer includes, so a bad combination aborts before anything starts.
     controller = LaunchConfiguration('controller').perform(context)
@@ -67,6 +54,16 @@ def check_controller(context):
     if controller == 'map' and LaunchConfiguration('avoid').perform(context).lower() in ('true', '1'):
         raise ValueError('MAP does not support avoid:=true')
     return []
+
+
+def controller_launch(context, include):
+    check_controller(context)
+    controller = LaunchConfiguration('controller').perform(context)
+    if controller == 'pure_pursuit':
+        return [include('control', 'pure_pursuit.launch.py', [
+            'track', 'pose_topic', 'speed_scale', 'max_speed', 'avoid',
+            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time'])]
+    return [include('control', 'map.launch.py', ['track', 'pose_topic', 'speed_scale', 'max_speed'])]
 
 
 def generate_launch_description():
