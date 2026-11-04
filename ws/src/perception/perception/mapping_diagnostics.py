@@ -133,8 +133,8 @@ def diagnose(map_yaml, online_path, final_path=None, odometry_path=None, mapping
             result['planner_geometry'] = {'passed': True, 'reason': None}
         except ImportError:
             result['planner_geometry'] = {'passed': None, 'reason': 'planning package unavailable'}
-        except RuntimeError as error:
-            result['planner_geometry'] = {'passed': False, 'reason': str(error)}
+        except Exception as error:  # a diagnostic: never abort a save that would otherwise succeed
+            result['planner_geometry'] = {'passed': False, 'reason': f'{type(error).__name__}: {error}'}
             result['interpretation'].append('Existing planner still rejects final graph geometry.')
     if odometry_path:
         odom = load_trajectory(odometry_path)

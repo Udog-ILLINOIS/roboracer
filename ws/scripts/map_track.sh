@@ -70,13 +70,31 @@ stop_group() {
 log="$HOME/ws/log/map_track_$name.log"
 follow_log="$HOME/ws/log/map_track_${name}_${follow_launch%%.*}.log"
 mkdir -p "$(dirname "$log")"
-# Never start a second map -> odom owner or competing controller.
-active_nodes=$(ros2 node list)
-if echo "$active_nodes" | grep -Eq '^/(cartographer_node|slam_toolbox|mcl|localization_gate|pure_pursuit_node|reactive_node|wall_follow_node|disparity_gap_node|teleop_keyboard)$'; then
-    echo 'Stop existing mapping, localization and driving nodes before mapping' >&2
+# Never start a second map -> odom owner or competing controller. Check processes, not
+# `ros2 node list` (it keeps a dead node listed until its DDS lease runs out). teleop_keyboard is
+# allowed: manual mapping drives with it, and it only publishes on a key press.
+running=$(pgrep -af '(^|/)(cartographer_node|async_slam_toolbox_node|sync_slam_toolbox_node|mcl_node|localization_gate|pure_pursuit_node|follow_the_gap_node|wall_follow_node|disparity_gap_node|map_node)( |$)' || true)
+if [ -n "$running" ]; then
+    echo "Stop existing mapping, localization and driving nodes before mapping:" >&2
+    echo "$running" >&2
     exit 1
 fi
 reset_sim_car
+if [ "$backend" = slam_toolbox ]; then
+    # SLAM Toolbox's map frame is /odom at the first scan, while race.sh/MCL put the car at the map
+    # origin after a sim reset. wheel_odom keeps its pose across resets, so /odom must start near zero.
+    odom_xy=$(timeout 5 ros2 topic echo --once /odom nav_msgs/msg/Odometry 2>/dev/null \
+        | awk '/^ *position:/{p=1} p&&/^ *x:/{x=$2} p&&/^ *y:/{y=$2; print x, y; exit}' || true)
+    if [ -z "$odom_xy" ]; then
+        echo "no /odom message: is the bridge (wheel_odom) running?" >&2; exit 1
+    fi
+    if awk -v xy="$odom_xy" 'BEGIN{split(xy,a," "); exit !(a[1]*a[1]+a[2]*a[2] > 0.25*0.25)}'; then
+        echo "/odom is at ($odom_xy), not at the reset start pose: SLAM Toolbox would put the map origin there," >&2
+        echo "and race.sh/MCL would start the car at the wrong place. Restart the bridge launch (wheel_odom)" >&2
+        echo "after the sim reset, then rerun." >&2
+        exit 1
+    fi
+fi
 # job control: the launch gets its own process group and keeps SIGINT (a script's background
 # jobs ignore it otherwise), so stopping it stops every node it started
 set -m
@@ -147,8 +165,8 @@ elif [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 if [ "$backend" = slam_toolbox ]; then
-    echo "Done: $tracks/$name (check preview.png). SLAM Toolbox graph is not a Cartographer pbstream."
-    echo "For MCL later, reset the car to its mapping start and launch: ros2 launch control race.launch.py track:=$name localizer:=mcl speed_scale:=0.3"
+    echo "Done: $tracks/$name (check preview.png). SLAM Toolbox graph is not a Cartographer pbstream,"
+    echo "so race with MCL: race $name localizer:=mcl speed_scale:=0.3  (scripts/race.sh)"
 else
     echo "Done: $tracks/$name (check preview.png). Race with: race $name  (scripts/race.sh)"
 fi

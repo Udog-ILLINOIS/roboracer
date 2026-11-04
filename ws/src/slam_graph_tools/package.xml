@@ -9,6 +9,6 @@
   <depend>slam_toolbox</depend>
   <depend>rclcpp</depend>
   <depend>boost</depend>
-  <depend>libtbb-dev</depend>
+  <depend>tbb</depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

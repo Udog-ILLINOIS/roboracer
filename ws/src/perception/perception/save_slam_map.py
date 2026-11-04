@@ -123,6 +123,7 @@ def save_bundle(out, grid, trajectory, serialize, extract=None, runtime=None):
         (stage / 'mapping.json').write_text(json.dumps({
             'backend': 'slam_toolbox', 'trajectory': 'corrected poses from serialized graph; map rasterized from same snapshot',
             'graph_prefix': 'map', 'resolution_m': .05}, indent=2) + '\n')
+        os.chmod(stage, 0o755)  # mkdtemp makes it 0700; the track dir is read from the host too
         # mkdir is exclusive, including a competing saver/validated destination.
         out.mkdir()
         try:
