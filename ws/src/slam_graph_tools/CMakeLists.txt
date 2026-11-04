@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)  # find_library(... REQUIRED)
 project(slam_graph_tools)
 find_package(ament_cmake REQUIRED)
 find_package(slam_toolbox REQUIRED)

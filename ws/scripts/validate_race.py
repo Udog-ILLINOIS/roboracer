@@ -23,7 +23,8 @@ NS = '/autodrive/roboracer_1/'
 BASE_NODES = {'fast_bridge', 'adapter', 'wheel_odom'}
 SENSORS = {'/scan', '/odom', '/sensors/imu/raw'}
 BLOCKED = {'pure_pursuit_node', 'reactive_node', 'wall_follow_node', 'disparity_gap_node',
-           'teleop_keyboard', 'cartographer_node', 'localization_gate', 'mcl', 'obstacle_spliner'}
+           'teleop_keyboard', 'cartographer_node', 'localization_gate', 'mcl', 'obstacle_spliner',
+           'slam_toolbox', 'slam_mapping_pose'}
 DISABLED = {'/validation/disabled_ground_truth', '/validation/disabled_reset_hint'}
 
 

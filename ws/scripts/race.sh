@@ -14,7 +14,10 @@ name=${1:?usage: race.sh <track name> [launch args]}
 shift
 source "$(dirname "$0")/common.sh"
 
-for f in map.pbstream raceline.csv; do
+# Cartographer localization needs map.pbstream; MCL (and SLAM Toolbox tracks, which have none) map.yaml
+need=(raceline.csv map.pbstream)
+for a in "$@"; do [ "$a" != localizer:=mcl ] || need=(raceline.csv map.yaml); done
+for f in "${need[@]}"; do
     [ -e "$tracks/$name/$f" ] || { echo "$tracks/$name/$f missing; run map-track $name  (scripts/map_track.sh)" >&2; exit 1; }
 done
 

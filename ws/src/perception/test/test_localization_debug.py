@@ -18,8 +18,9 @@ def odom(x, y, yaw=0.0, speed=0.0):
     return m
 
 
-def pose(x, y, yaw=0.0):
+def pose(x, y, yaw=0.0, frame='map'):
     m = PoseStamped()
+    m.header.frame_id = frame
     m.pose.position.x, m.pose.position.y = x, y
     m.pose.orientation.z, m.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
     return m
@@ -105,3 +106,9 @@ def test_a_missing_map_to_world_says_so(tmp_path, monkeypatch):
             LocalizationDebug()
     finally:
         rclpy.try_shutdown()
+
+
+def test_a_pose_in_another_frame_is_ignored(node):
+    node.truth_cb(odom(1.0, 3.0, math.pi / 2))
+    node.pose_cb(pose(5.0, 5.0, frame='odom'))
+    assert node.errors == [] and node.pose_t is None
