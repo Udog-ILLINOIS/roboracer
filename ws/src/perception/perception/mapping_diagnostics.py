@@ -117,7 +117,7 @@ def diagnose(map_yaml, online_path, final_path=None, odometry_path=None, mapping
         result['final'] = {'occupancy': occupancy(final, meta, free, occupied), 'motion': motion(final)}
         result['online_to_final'] = match_corrections(online, final)
         graph_map = Path(final_path).with_name('map.yaml')
-        if graph_map.exists():
+        if graph_map.exists() and graph_map.resolve() != Path(map_yaml).resolve():  # not a file with itself
             result['graph_raster_comparison'] = compare_rasters(map_yaml, graph_map)
         if result['online_to_final']['corrections_over_0_5_m']:
             result['interpretation'].append('Historical online poses received large later graph corrections.')

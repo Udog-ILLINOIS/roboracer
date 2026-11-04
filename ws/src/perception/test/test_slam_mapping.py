@@ -1,4 +1,5 @@
 """SLAM Toolbox mapping: interfaces/config, transactional saves and planner contract."""
+import json
 import importlib.util
 import math
 import os
@@ -165,6 +166,11 @@ def test_bundle_published_only_after_graph_pair_validated(tmp_path):
     assert not (out / 'map.pbstream').exists()
     assert not (out / 'map_to_world.yaml').exists()
     assert len((out / 'trajectory.csv').read_text().splitlines()) == 13
+    # the live /map is compared with the graph raster (not the saved raster with itself), then dropped
+    comparison = json.loads((out / 'mapping_diagnostics.json').read_text())['graph_raster_comparison']
+    assert comparison['live_map_vs_graph'] and comparison['geometry_matches'] is not None
+    assert not (out / 'live').exists()
+    assert oct((out).stat().st_mode & 0o777) == oct(0o755)
     original = (out / 'map.pgm').read_bytes()
     with pytest.raises(FileExistsError):
         save_bundle(out, grid(), trajectory(), serializer)

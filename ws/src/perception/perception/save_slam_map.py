@@ -1,8 +1,9 @@
 """Save a stopped SLAM Toolbox mapping session, without overwriting a track.
 
 The installed Humble SerializePoseGraph API takes a prefix, writes .posegraph and
-.data, and reports RESULT_SUCCESS=0. Occupancy grids retain Cartographer's map
-encoding; final corrected graph poses supply the planner's direction/length checks; online poses are retained separately.
+.data, and reports RESULT_SUCCESS=0. The saved map.pgm/map.yaml and trajectory.csv both come from the
+serialized graph snapshot; the live /map (Cartographer's map encoding) is only compared with it
+(mapping_diagnostics.json graph_raster_comparison). Online poses are retained separately.
 """
 import json
 import math
@@ -26,7 +27,7 @@ from std_msgs.msg import String
 from slam_toolbox.srv import SerializePoseGraph
 
 from perception.tracks import tracks_dir
-from perception.mapping_diagnostics import diagnose
+from perception.mapping_diagnostics import compare_rasters, diagnose
 
 
 def destination(name):
@@ -99,7 +100,8 @@ def save_bundle(out, grid, trajectory, serialize, extract=None, runtime=None):
         raise FileExistsError(f'{out} exists; choose a new track name')
     stage = Path(tempfile.mkdtemp(prefix=f'.{out.name}-saving-', dir=out.parent))
     try:
-        write_grid(stage, grid)
+        (stage / 'live').mkdir()
+        write_grid(stage / 'live', grid)   # the live /map, only to compare with the graph raster
         write_trajectory(stage, trajectory)
         (stage / 'trajectory.csv').rename(stage / 'trajectory_online.csv')
         serialize(str(stage / 'map'))
@@ -117,6 +119,9 @@ def save_bundle(out, grid, trajectory, serialize, extract=None, runtime=None):
         if (report['final']['motion']['samples'] < 11
                 or report['online_to_final']['unmatched_online']):
             raise RuntimeError('serialized graph does not cover this mapping trajectory')
+        report['graph_raster_comparison'] = {'live_map_vs_graph': True,
+                                             **compare_rasters(stage / 'live' / 'map.yaml', stage / 'map.yaml')}
+        shutil.rmtree(stage / 'live')
         report['runtime'] = runtime
         (stage / 'mapping_diagnostics.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
         validate_artifacts(stage)
