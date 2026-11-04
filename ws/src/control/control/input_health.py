@@ -2,9 +2,10 @@
 
 Heading is propagated with fresh measured yaw rate on monotonic time while input
 poses are rejected. Stable but wrong poses cannot re-arm just by being repeated while
-the car moves. At standstill (no yaw rate to propagate, e.g. after a localizer relocates
-the car) a pose heading that stays self-consistent for reseed_seconds becomes the new
-reference, then goes through the normal recovery wait; otherwise the latch never clears.
+the car moves. When the caller confirms a standstill (map_node: wheel speed and pose
+position both still for reseed_seconds, and the heading follows the raceline), a pose
+heading that then stays self-consistent for reseed_seconds becomes the new reference and
+goes through the normal recovery wait; otherwise the latch would never clear.
 """
 import math
 
