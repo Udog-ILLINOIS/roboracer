@@ -99,6 +99,13 @@ def test_map_ros_commands_stops_and_recovers():
             assert drives[-1].drive.speed == 0  # no immediate re-arm on one fresh pose
             publish()
             assert drives[-1].drive.speed > 0
+            # Relocated to the far side of the circle (4 m jump, heading reversed): while the wheels
+            # report motion the latches hold, however long the new pose is steady ...
+            publish(x=-2., yaw=-math.pi/2, speed=1., duration=2.6)
+            assert max(d.drive.speed for d in drives[-40:]) == 0
+            # ... and at a confirmed standstill (wheels + pose still) the pose becomes the new reference.
+            publish(x=-2., yaw=-math.pi/2, speed=0., duration=3.5)
+            assert drives[-1].drive.speed > 0
         finally:
             executor.remove_node(tester)
             executor.remove_node(map_node)
