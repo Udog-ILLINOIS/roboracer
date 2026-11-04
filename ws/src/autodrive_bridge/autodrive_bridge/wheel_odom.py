@@ -9,11 +9,12 @@ vesc_to_odom publishes /odom from the VESC instead and this node is not launched
   speed    = distance over the last speed_window seconds  (sim frames arrive unevenly, so
              a single-frame difference is noisy)
   yaw rate = IMU gyro z (use_imu_yaw_rate, default), or the bicycle model
-             speed * tan(steering angle) / wheelbase, which reads only ~55% of the sim's real
-             turn rate (measured on Porto) and made Cartographer drift in hairpins
+             speed * tan(steering angle) / wheelbase. The simulator's steering
+             feedback is already in radians; applying the steering-lock scale
+             a second time made this fallback read roughly half the real yaw rate.
 
 Subscribed (vehicle_ns = /autodrive/roboracer_1):
-  left_encoder, right_encoder (JointState, cumulative wheel angle in rad), steering (Float32, -1..1),
+  left_encoder, right_encoder (JointState, cumulative wheel angle in rad), steering (Float32, rad),
   imu (Imu)
 """
 import math
@@ -89,7 +90,7 @@ class WheelOdom(Node):
         self.x = self.y = self.yaw = 0.0
 
     def steering_cb(self, msg):
-        self.steer = float(msg.data) * self.max_steer
+        self.steer = float(msg.data)
 
     def imu_cb(self, msg):
         self.gyro_z = msg.angular_velocity.z
