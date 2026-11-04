@@ -102,7 +102,7 @@ def test_launch_and_config_use_installed_async_interface():
     assert "('pose', '/mapping/slam_pose')" in text
     assert 'ground_truth' not in text and 'map_origin' not in text.replace('no map_origin', '')
     config = yaml.safe_load((PACKAGE / 'config/slam_mapping.yaml').read_text())['slam_toolbox']['ros__parameters']
-    assert config['mode'] == 'mapping' and config['use_sim_time'] is False
+    assert config['mode'] == 'mapping' and config['use_sim_time'] is True
     assert (config['map_frame'], config['odom_frame'], config['base_frame']) == ('map', 'odom', 'base_link')
     assert config['scan_topic'] == '/scan' and config['resolution'] == .05
     assert config['transform_publish_period'] > 0
