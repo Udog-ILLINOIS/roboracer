@@ -22,6 +22,7 @@ ros2 run autodrive_bridge teleop_keyboard           # shell 3: drive the mapping
 scripts/race.sh <name> [speed_scale:=0.5]           # localization + pure pursuit                  race
 scripts/race.sh <name> avoid:=true                  #   ... passing obstacles the map did not have
 ros2 launch control follow_the_gap.launch.py [speed:=1.0]   # no-map fallback, instead of race.sh   ftg
+ros2 run planning plan_segment <name> --start-s 10 --opponent 6.9 0 4   # offline overtaking segments (below)
 ```
 
 Restart the bridge with Ctrl-C in shell 1 (SIGINT to the whole process group; or `kill -INT -- -<pgid>`),
@@ -74,8 +75,48 @@ Check with `ros2 node list` and kill leftovers before the next launch.
 |---|---|
 | `autodrive_bridge` | `fast_bridge`, `adapter`, `wheel_odom`, `teleop_keyboard`; `autodrive_launch.py`. Sim only: replaced by f1tenth_system on the car. |
 | `perception` | Cartographer configs, `mapping.launch.py`, `localization.launch.py`, `save_map`, `map_origin`. Particle filter localization instead of Cartographer's: `mcl.launch.py` (`mcl_node`, `mcl.py`, `config/mcl.yaml`). Experimental, not in the pipeline: `ekf.launch.py` (robot_localization IMU EKF + `corrector`, a drift-corrected forward speed on `/odometry/corrected`, sim only) |
-| `planning` | `build_raceline` = `centerline` extraction + TUM `mintime` optimization. `obstacle_spliner_node`: stationary-obstacle avoidance, `/local_path` (`race.launch.py avoid:=true`) |
+| `planning` | `build_raceline` = `centerline` extraction + TUM `mintime` optimization. `obstacle_spliner_node`: stationary-obstacle avoidance, `/local_path` (`race.launch.py avoid:=true`). `plan_segment` (offline, not in the race pipeline yet): minimum-time overtaking segments |
 | `control` | `pure_pursuit_node`, `pure_pursuit.launch.py`, `race.launch.py`. `follow_the_gap_node` (`follow_the_gap.launch.py`): reactive `/scan` -> `/drive`, needs no map, the fallback. `wall_follow_node` (`wall_follow.launch.py`): drives the mapping laps (`map_track.sh --wall-follow`), the default. `disparity_gap_node` (`disparity_gap.launch.py`): follow the gap with disparity extension, also drives the mapping laps (`map_track.sh --gap-follow`, experimental: see control/README.md) |
+
+## The pass line
+
+`obstacle_spliner_node` goes round an obstacle on a *pass line* (`pass_line:=true`, the default;
+`pass_line:=false` is the fixed ease in, hold, ease out). Near a minimum-time raceline a sideways offset
+costs time only to second order, so the offset from the car, past the obstacle and back onto the raceline
+is a small QP in the raceline's frame: least added curvature (as lateral acceleration at the planned speed)
+and path length, inside the track with the obstacle cut out. Its Hessian is pentadiagonal, so one solve takes
+about 1 ms with numpy and scipy (`planning/pass_line.py`). The return is not prescribed: rejoining 2.5 to 13 m
+past the obstacle is solved and the one losing least time on a speed profile is taken. A pass is followed until
+it has rejoined the raceline, also with the obstacle behind the car. Pure pursuit keeps the raceline's speeds,
+so a line curving more than the raceline is driven at them, see the lateral acceleration it asks for.
+
+## Overtaking segments (offline)
+
+`plan_segment` solves TUM's mintime problem (same vehicle model as the raceline) on an open stretch of the
+track: from the car's state to a window end, with the global raceline as the seed and as the target of a
+terminal cost at the end. An opponent ahead, predicted at constant speed along the raceline, is blocked
+out of the track widths where we would be next to it, once passing on each side; a side with no room
+there is rejected. The first steering change obeys the steering-rate limit from the car's steering now
+(`--start-delta`, default the raceline's); a start speed under 0.5 m/s is raised to it (the model divides
+by speed). `--start-v` and the opponent's speed are real speeds, divided by `--speed-scale`. Curvature,
+end target and steering are solver parameters, so one IPOPT solver per window length is built and reused
+for both sides and every re-solve.
+There are three windows, counted from the car: `A` = exit of the first corner, `B` = exit of the second
+corner, `C` = after the second corner (the braking point of the third). Corners with a straight under
+`--min-straight` between them (a chicane) count as one. Each is solved once per side of the opponent. A
+segment is viable if it can pass (solved, keeps clear of the predicted opponent, rejoins the raceline) and
+ends at least 0.5 m (bumper to bumper) ahead of the opponent on the raceline; every viable segment is listed,
+least time lost to the raceline first (the first is the one chosen), and only those are written. A corner is where the raceline's `|kappa|`, averaged over `--smooth` (1 m), is `>= --kappa-min` (0.2 1/m) and
+which turns at least `--min-turn` (30 deg). Every window is cut to `--max-window` (60 m and 3/4 of a lap; the
+solve time grows with it), reported as `window capped`. Distances along the track (car lengths, margins,
+how far ahead we end) are raceline metres. The blocked stretch is re-solved until it stops growing (at most
+4 solves); if it is still growing, new points too close to the opponent reject the side, clear ones are
+reported (`blocked stretch not settled`). While nothing is blocked both sides are the same problem: it is
+solved once (`solve(s) reused`). Output: `tracks/<name>/segments/<mode>_<side>.csv` (viable only: raceline
+columns, `s` from the car) and `<mode>.png` (with the opponent at t = 0, its predicted path, and where it is when each
+side passes closest). Code: `planning/tum_segment.py` (TUM venv),
+`segment_geometry.py`, `segment.py`, `plan_segment.py`; the open-segment option of `opt_mintime` is part
+of `docker/tum_mintime.patch` (rebuild the image after pulling it).
 
 ## Interfaces
 

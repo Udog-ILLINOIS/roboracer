@@ -13,7 +13,7 @@ from geometry_msgs.msg import PoseStamped, TransformStamped  # noqa: E402
 from rclpy.parameter import Parameter  # noqa: E402
 from sensor_msgs.msg import LaserScan  # noqa: E402
 
-from planning.obstacle_spliner_node import ObstacleSpliner  # noqa: E402
+from planning.obstacle_spliner_node import ObstacleSpliner, fill_unknown_specks  # noqa: E402
 
 R_IN, R_OUT, R_LINE = 3.0, 5.0, 4.0
 RES, HALF = 0.05, 6.0   # map: 12 x 12 m around the origin
@@ -235,6 +235,158 @@ def test_lidar_mount_offset(node):
 def test_blocked_track_is_not_valid(node):
     _, valid = tick(node, 0.0, (2.0 / R_LINE, R_LINE, 0.8))   # leaves 0.2 m each side
     assert not valid
+
+
+@pytest.mark.parametrize('radius, gap', [(0.55, 0.45), (0.5, 0.5)])
+def test_tight_gap_is_driven_not_refused(node, radius, gap):
+    # the preferred 0.33 m past the obstacle leaves under 0.33 m to the wall, yet the car fits
+    obstacle = (2.0 / R_LINE, R_LINE, radius)
+    xy, valid = tick(node, 0.0, obstacle)
+    assert valid, f'{gap} m beside the obstacle'
+    r = radii(xy)
+    assert np.all((r >= R_IN + 0.17) & (r <= R_OUT - 0.17))     # inside the walls by more than half the car
+    centre = on_ring(obstacle[0])
+    # its footprint clears the obstacle, though from here the lidar sees a round obstacle narrower than it is
+    assert np.min(np.linalg.norm(xy - centre, axis=1)) >= radius + 0.135
+
+
+def test_unknown_specks_inside_the_track_are_track():
+    track = np.ones((40, 40), bool)
+    track[0], track[-1], track[:, 0], track[:, -1] = False, False, False, False   # the outside
+    occupied = np.zeros_like(track)
+    track[10:12, 10:12] = False                     # small, unknown: the lidar did not see it
+    track[20:22, 20:22] = False                     # small, with an occupied cell: a real thing
+    occupied[20, 20] = True
+    track[28:37, 5:35] = False                      # unknown, but too large to assume
+    out = fill_unknown_specks(track, occupied, 0.05)
+    assert out[10:12, 10:12].all()
+    assert not out[20:22, 20:22].any()
+    assert not out[28:37, 5:35].any()
+    assert not out[0].any()                         # the outside stays outside
+
+
+def pass_setup(node, *clusters_d):
+    """Points at the given (d_right, d_left) stretches 2 m ahead of the raceline's start, and each point's rel."""
+    i = int(np.argmin(np.abs(node.s - 2.0)))
+    pts = np.vstack([node.base_xy[i] + np.linspace(a, b, 5)[:, None] * node.normal[i] for a, b in clusters_d])
+    rel = (node.s + node.lap / 2) % node.lap - node.lap / 2
+    return rel, pts
+
+
+def test_tight_search_goes_past_a_box_beside_the_obstacle(node):
+    # blocking -0.3..0.1; a box beside it at 0.35..0.4 is off the line, so not in the blocking edge: the goals past
+    # the blocking edge end 0.18 m from that box, too close
+    rel, pts = pass_setup(node, (-0.3, 0.1), (0.35, 0.4))
+    without = node.pass_candidates(rel, 1.9, 2.1, -0.3, 0.1, pts)
+    assert without[1][0] == 'rejected'
+    assert node.pass_candidates(rel, 1.9, 2.1, -0.3, 0.1, pts, beside=[(0.35, 0.4)])[1][0] == 'tight'
+
+
+def test_car_already_past_the_obstacle_may_stay_where_it_is(node):
+    rel, pts = pass_setup(node, (-0.3, 0.1), (0.35, 0.4))
+    assert node.pass_candidates(rel, 1.9, 2.1, -0.3, 0.1, pts)[1][0] == 'rejected'
+    state, shift, _, _ = node.pass_candidates(rel, 1.9, 2.1, -0.3, 0.1, pts, ego_d=0.65)[1]
+    assert state == 'tight' and shift == pytest.approx(0.65)
+
+
+def test_obstacle_beside_the_raceline_is_left_alone(node):
+    # its edge 0.25 m from the line: the car on the line clears it. A nudge away at most, never around its far side
+    xy, valid = tick(node, 0.0, (2.0 / R_LINE, R_LINE - 0.25 - 0.15, 0.15))
+    assert valid
+    assert np.max(np.linalg.norm(xy - node.base_xy, axis=1)) < 0.12
+    assert np.all(radii(xy) > R_LINE - 0.25)                   # never on the obstacle's side
+
+
+def test_obstacle_beside_the_raceline_is_never_a_reason_to_stop(node, monkeypatch):
+    # no room for the nudge: the car stays on the raceline, it does not stop or take a tight path
+    monkeypatch.setattr(node, 'collision_free', lambda *a: False)
+    xy, valid = tick(node, 0.0, (2.0 / R_LINE, R_LINE - 0.25 - 0.15, 0.15))
+    assert valid
+    assert np.allclose(xy, node.base_xy, atol=1e-6)
+
+
+@pytest.mark.parametrize('off', [0.4, -0.4])
+def test_paths_start_at_the_car_off_the_line(node, off):
+    # the car off the raceline, an obstacle on it ahead: the path steered on begins where the car is
+    xy, valid = tick(node, 0.0, (3.0 / R_LINE, R_LINE, 0.15), car_r=R_LINE - off)
+    assert valid
+    car = on_ring(0.0, R_LINE - off)
+    assert np.min(np.linalg.norm(xy - car, axis=1)) < 0.06
+
+
+def test_clear_track_leads_back_to_the_raceline_from_the_car(node):
+    xy, valid = tick(node, 0.0, car_r=R_LINE - 0.4)
+    assert valid
+    assert np.min(np.linalg.norm(xy - on_ring(0.0, R_LINE - 0.4), axis=1)) < 0.06
+    far = np.abs(np.angle(np.exp(1j * np.arctan2(xy[:, 1], xy[:, 0])))) > math.pi / 2
+    assert np.allclose(xy[far], node.base_xy[far])
+
+
+def test_way_back_to_the_raceline_does_not_run_into_a_box_beside_it(node):
+    # the car 0.45 m inside the line, a box 1.2 m ahead with its edge 0.4 m inside: it does not block the raceline
+    # and the gentle way back passes 0.16 m from it, so the sharper one is taken
+    angle, r, radius = 1.2 / R_LINE, R_LINE - 0.55, 0.15
+    xy, valid = tick(node, 0.0, (angle, r, radius), car_r=R_LINE - 0.45)
+    assert valid
+    th = np.angle(np.exp(1j * np.arctan2(xy[:, 1], xy[:, 0])))
+    ahead = (th * R_LINE >= 0.3) & (th * R_LINE <= 3.0)
+    assert np.min(np.linalg.norm(xy[ahead] - on_ring(angle, r), axis=1)) >= radius + node.tight_clearance - 0.03
+
+
+def refused(c):
+    return {side: ('rejected', v[1], v[2], v[3]) for side, v in c.items()}
+
+
+def test_a_pass_being_driven_is_kept_through_refusals(node, monkeypatch):
+    obstacle, t = (2.0 / R_LINE, R_LINE, 0.15), next(CLOCK)
+    first, valid = tick(node, 0.0, obstacle, t=t)
+    assert valid
+    real = node.pass_candidates
+    monkeypatch.setattr(node, 'pass_candidates', lambda *a: refused(real(*a)))
+    for k in range(1, 12):                                # 1.1 s of refusals: no stop, the same pass
+        xy, valid = tick(node, 0.0, obstacle, t=t + 0.1 * k)
+        assert valid
+        assert np.allclose(xy, first, atol=0.03)
+    node.driven = None
+
+
+def test_a_pass_is_not_kept_with_an_obstacle_on_it(node, monkeypatch):
+    t = next(CLOCK)
+    first, valid = tick(node, 0.0, (2.0 / R_LINE, R_LINE, 0.15), t=t)
+    assert valid
+    th = np.angle(np.exp(1j * np.arctan2(first[:, 1], first[:, 0])))
+    r = float(np.hypot(*first[int(np.argmin(np.abs(th - 2.0 / R_LINE)))]))
+    real = node.pass_candidates
+    monkeypatch.setattr(node, 'pass_candidates', lambda *a: refused(real(*a)))
+    # reaches from the path across the raceline, so it blocks both
+    _, valid = tick(node, 0.0, (2.0 / R_LINE, r, abs(r - R_LINE) + 0.1), t=t + 0.1)
+    assert not valid
+    node.driven = None
+
+
+def test_pass_starts_at_the_car_also_close_to_the_line(node):
+    # 0.1 m off the raceline: under OFF_LINE, yet a pass begins at the car
+    xy, valid = tick(node, 0.0, (2.0 / R_LINE, R_LINE, 0.15), car_r=R_LINE - 0.1)
+    assert valid
+    assert np.min(np.linalg.norm(xy - on_ring(0.0, R_LINE - 0.1), axis=1)) < 0.06
+    node.driven = None
+
+
+def test_candidates_never_leave_the_track(node):
+    # shifted past the outer wall: it fails the check, and is published pulled back onto the track
+    offset = np.full(node.n, -2.0)
+    path = node.base_xy + offset[:, None] * node.normal
+    moved = np.abs(offset) > 1e-9
+    assert not node.collision_free(path, moved, np.empty((0, 2)))
+    assert np.all(node.clearances(node.kept_on_track(path)) > 0)
+
+
+def test_off_track_point_fails_where_the_raceline_hugs_the_edge(node, monkeypatch):
+    # within a map cell of the edge the raceline's own clearance, less a cell, is negative: still not off the track
+    monkeypatch.setattr(node, 'base_clear', np.full(node.n, 0.5 * node.map.res))
+    offset = np.full(node.n, -2.0)
+    path = node.base_xy + offset[:, None] * node.normal
+    assert node.margin_of(path, np.abs(offset) > 1e-9, np.empty((0, 2)), 0.205, 0.205) < 0.0
 
 
 def test_pose_at_interpolates_between_the_poses_around_a_stamp(node):
@@ -480,3 +632,44 @@ def test_drives_past_a_long_board_beside_the_wall(outer_node, lateral_error, v, 
             radius = float(np.hypot(*xy[np.argmin(np.abs(np.angle(np.exp(1j * (th - angle - 0.3 / rl)))))]))
         angle += v / 15 / rl
     assert worst > 0.08   # the car's side keeps clear of the board all along
+
+
+def test_pass_line_is_followed_back_onto_the_raceline(node):
+    # closed loop past an obstacle: the car stays clear, the return is still driven once the obstacle is behind it
+    # (it no longer blocks anything), without a step in the path, until the car is back on the raceline
+    obstacle = (3.0 / R_LINE, R_LINE, 0.15)
+    angle, radius, t = 0.0, R_LINE, 5000.0
+    step = 0.2 / R_LINE
+    offsets, passed_offsets = [], []
+    while angle < obstacle[0] + 14.0 / R_LINE:
+        xy, valid = tick(node, angle, obstacle, car_r=radius, t=t)
+        assert valid
+        th = np.arctan2(xy[:, 1], xy[:, 0])
+        radius = float(np.hypot(*xy[np.argmin(np.abs(np.angle(np.exp(1j * (th - angle - 0.3 / R_LINE)))))]))
+        offsets.append(radius - R_LINE)
+        if angle > obstacle[0] + 0.9 / R_LINE:
+            passed_offsets.append(abs(radius - R_LINE))
+        if abs(angle - obstacle[0]) < 0.3 / R_LINE:
+            assert abs(radius - R_LINE) > obstacle[2] + HALF_WIDTH
+        angle += step
+        t += 0.05
+    assert np.max(np.abs(np.diff(offsets))) < 0.1           # no step anywhere
+    assert passed_offsets[0] > 0.05                         # still off the raceline with the obstacle behind it
+    assert abs(offsets[-1]) < 0.01                          # and back on it
+
+
+def test_pass_line_off_uses_the_eased_shift(ros, track):
+    n = ObstacleSpliner(parameter_overrides=[Parameter('raceline_path', value=str(track / 'raceline.csv')),
+                                             Parameter('map_yaml', value=str(track / 'map.yaml')),
+                                             Parameter('pass_line', value=False)])
+    n.lidar = (0.0, 0.0, 0.0)
+    n.published = []
+    n.publish = lambda xy, valid: n.published.append((np.array(xy), valid))
+    obstacle = (2.0 / R_LINE, R_LINE, 0.15)
+    xy, valid = tick(n, 0.0, obstacle)
+    n.destroy_node()
+    assert valid
+    off = radii(xy) - R_LINE
+    th = np.mod(np.arctan2(xy[:, 1], xy[:, 0]), 2 * np.pi)
+    # eased out within end_distance past obstacle_length past its far face, and flat at the goal beside it
+    assert np.allclose(off[(th * R_LINE > 2.0 + 0.15 + 0.5 + 2.5 + 0.2) & (th < math.pi)], 0.0, atol=1e-6)

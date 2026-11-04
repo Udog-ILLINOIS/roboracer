@@ -18,7 +18,7 @@ alias cbclean="cd ~/ws && rm -rf build/ install/ log/build_* log/test_* log/late
 # Bridge to the AutoDRIVE simulator (Connect the sim to 127.0.0.1:4567 after this)
 alias sim="ros2 launch autodrive_bridge autodrive_launch.py"
 
-# Keyboard teleop on /drive (W/S speed, A/D steer, X stop, R reset)
+# Keyboard teleop on /drive (hold W/S speed, hold A/D steer, E brake, X stop, R reset)
 alias kb="ros2 run autodrive_bridge teleop_keyboard"
 
 # Map a new track and plan its min-time raceline: map-track <name> [--wall-follow | --gap-follow] [--laps N]

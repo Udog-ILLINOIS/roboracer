@@ -11,6 +11,8 @@ particle cloud has converged), so the car waits for that. localizer:=mcl is the 
 (perception mcl.launch.py); the default is Cartographer pure localization.
 avoid:=true also starts planning's obstacle_spliner_node on the track's raceline and map, and pure
 pursuit follows its /local_path around obstacles the map did not have (stopping when there is none).
+pass_line:=false (with avoid:=true) goes round obstacles on the eased shift instead of the solved pass line.
+segments:=true (with avoid:=true) runs planning's segment_planner_node in its place: minimum-time segments.
 adaptive_lookahead:=true (the default) caps pure pursuit's lookahead by the curvature of the raceline ahead (see
 pure_pursuit_node), for tight corners at full speed.
 """
@@ -30,7 +32,12 @@ def obstacle_spliner(context):
     if LaunchConfiguration('avoid').perform(context).lower() not in ('true', '1'):
         return []
     d = track_dir(LaunchConfiguration('track').perform(context))
-    return [Node(package='planning', executable='obstacle_spliner_node', output='screen', parameters=[{
+    segments = LaunchConfiguration('segments').perform(context).lower() in ('true', '1')
+    executable = 'segment_planner_node' if segments else 'obstacle_spliner_node'
+    extra = {'speed_scale': float(LaunchConfiguration('speed_scale').perform(context))} if segments else {}
+    extra['pass_line'] = LaunchConfiguration('pass_line').perform(context).lower() in ('true', '1')
+    return [Node(package='planning', executable=executable, output='screen', parameters=[{
+        **extra,
         'raceline_path': os.path.join(d, 'raceline.csv'),
         'map_yaml': os.path.join(d, 'map.yaml'),
         'pose_topic': LaunchConfiguration('pose_topic'),
@@ -53,6 +60,10 @@ def generate_launch_description():
         DeclareLaunchArgument('max_speed', default_value='0.0', description='cap on the drive speed [m/s], 0 = no cap'),
         DeclareLaunchArgument('avoid', default_value='false',
                               description='avoid obstacles the map did not have (obstacle_spliner_node)'),
+        DeclareLaunchArgument('segments', default_value='false',
+                              description='with avoid: minimum-time overtaking segments (segment_planner_node) instead of the spliner'),
+        DeclareLaunchArgument('pass_line', default_value='true',
+                              description='with avoid: pass line (solved around the obstacle, back onto the raceline); false: the eased shift'),
         DeclareLaunchArgument('localizer', default_value='cartographer',
                               description='cartographer: pure localization on map.pbstream; mcl: particle filter on map.yaml'),
         DeclareLaunchArgument('adaptive_lookahead', default_value='true',

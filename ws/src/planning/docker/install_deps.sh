@@ -19,7 +19,8 @@ rm -rf /var/lib/apt/lists/*
 
 git clone --quiet "$TUM_REPO" "$TUM_DIR"
 git -C "$TUM_DIR" checkout --quiet "$TUM_COMMIT"
-# Scaling factors / yaw-rate bound configurable for a 1/10 car, and the yaw-moment arm fix.
+# Scaling factors / yaw-rate bound configurable for a 1/10 car, the yaw-moment arm fix, and open
+# segments (pars optim_opts segment: fixed start state, terminal cost, no lap closure) for planning/tum_segment.py.
 git -C "$TUM_DIR" apply "$HERE/tum_mintime.patch"
 
 python3 -m venv "$VENV"

@@ -47,12 +47,10 @@ def load_pars(ini):
     return pars
 
 
-def main():
-    track_csv, ini, out_csv, work_dir = sys.argv[1:5]
-    pars = load_pars(ini)
-    os.makedirs(work_dir, exist_ok=True)
-    t_start = time.perf_counter()
+def prep_reftrack(track_csv, pars):
+    """Reference line the optimizer works on: (reftrack [x, y, w_right, w_left], normvec (right), coeffs_x, coeffs_y).
 
+    Deterministic, so tum_segment.py rebuilds exactly the line the global raceline was optimized on."""
     reftrack_imp = helper_funcs_glob.src.import_track.import_track(
         file_path=track_csv, width_veh=pars['veh_params']['width'],
         imp_opts={'flip_imp_track': False, 'set_new_start': False, 'num_laps': 1})
@@ -73,6 +71,16 @@ def main():
     reftrack[:, 2], reftrack[:, 3] = w_r, w_l
     if tph.check_normals_crossing.check_normals_crossing(track=reftrack, normvec_normalized=normvec, horizon=10):
         raise IOError('spline normals still cross after narrowing the track')
+    return reftrack, normvec, coeffs_x, coeffs_y
+
+
+def main():
+    track_csv, ini, out_csv, work_dir = sys.argv[1:5]
+    pars = load_pars(ini)
+    os.makedirs(work_dir, exist_ok=True)
+    t_start = time.perf_counter()
+
+    reftrack, normvec, coeffs_x, coeffs_y = prep_reftrack(track_csv, pars)
 
     alpha_opt, v_opt, reftrack, a_tmp, normvec = opt_mintime_traj.src.opt_mintime.opt_mintime(
         reftrack=reftrack, coeffs_x=coeffs_x, coeffs_y=coeffs_y, normvectors=normvec, pars=pars,

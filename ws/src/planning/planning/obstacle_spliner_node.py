@@ -17,8 +17,8 @@ raceline (s along it, d to its left). Walls are not obstacles, and an obstacle n
 of it; the margin grows with range since a small heading error, or a map a little off, moves far
 returns most. An obstacle is its points, not a circle around them.
 
-The nearest cluster the car would hit (a point within vehicle_half_width + safety_margin of the raceline),
-from lookahead m ahead until the car is past it, gets passed, together with the clusters in the way that
+The nearest cluster the car would hit (a point within vehicle_half_width + safety_margin of the raceline), from
+lookahead m ahead until the car is past it, gets passed, together with the clusters in the way that
 start before it ends (one obstacle the scan split, or obstacles too close to pass one at a time): the
 raceline's points move sideways to vehicle_half_width + safety_margin beyond their leftmost or rightmost
 point, easing in over start_distance m (quintic smoothstep), holding from their nearest point to
@@ -29,6 +29,37 @@ smaller shift is taken.
 Collision-free: the shifted stretch keeps vehicle_half_width + safety_margin from the walls (or the
 raceline's own clearance where that is smaller: the raceline runs closer than that in places) and
 vehicle_half_width + safety_margin / 2 from every point of every cluster.
+
+Every pass starts at the car: its offset from the raceline blends into the planned shift, so a car off the line has
+a path it can drive. On a clear track a car more than OFF_LINE off the raceline (less is localization noise) gets a
+path back onto it (checked like any path: the gentlest blend clear of walls and every cluster). The first few cm
+ahead of the car are not checked: it is already there.
+
+A pass being driven is kept while it stays clear in each new scan, starting at the car each tick. With less than
+the full clearances it gives way to a path that has them; tight, it is kept over another tight path; and if nothing
+else fits it still goes on while it physically clears everything. Only an obstacle on it, with no other way, stops
+the car.
+
+An obstacle that does not block the raceline: when every point of the obstacle is at least tight_clearance from
+the raceline, the car on the raceline clears it, and a swerve around it can only add risk. It only gets a nudge
+away from it with the full clearances, and otherwise the car stays on the raceline; it is never a reason to take a
+tight path, to cross to its far side, or to stop.
+
+A tight gap: a side whose preferred path is not collision-free is searched for where in the gap to go, keeping
+tight_clearance from walls and obstacle, and takes the position with the most clearance. A side with its
+preferred path is taken over one that is only tight, unless the tight one is being driven. Only gaps that
+leave no such position on either side are a real blockage (/local_path/valid false, and the car stops).
+
+The pass line (pass_line:=true, the default): the shift between the car and the raceline is not the fixed ease in, hold
+and ease out above but the solution of planning.pass_line: the least added curvature and path length from the car, past
+the obstacle and back onto the raceline, inside the track, in about a millisecond. Rejoining at each of PASS_TAILS m past
+the obstacle is solved and the one losing least time on a speed profile is taken, of those that clear everything. With
+no such line the eased shift above is tried: the pass line never leaves the car with fewer ways round an obstacle. Once
+the obstacle is behind the car, a pass being driven is followed until it has rejoined the raceline.
+
+Publishes each side's candidate for inspection on /local_path/candidate_left and _right (only its moved
+points, empty when it has none; a rejected one pulled back onto the track) and /local_path/candidate_status
+('left=<state> right=<state>', state: ok, tight or rejected).
 
 Publishes /local_path (nav_msgs/Path, map frame, one pose per raceline point: control's
 pure_pursuit_node with avoid:=true steers on it) and /local_path/valid (std_msgs/Bool): false when the
@@ -52,10 +83,11 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from scipy.ndimage import distance_transform_edt, label, map_coordinates
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from planning.centerline import OccupancyMap
+from planning.pass_line import path_curvature, solve_offsets, time_lost
 from planning.raceline import read_raceline
 
 STEP = 0.04   # m between the points checked along the path
@@ -79,7 +111,50 @@ ALIGN_JUMP = (0.05, math.radians(0.5))
 ALIGN_MEMORY = 0.5
 ALIGN_KEEP = 0.7
 ALIGN_RELOCATE = (0.5, math.radians(10.0))
+# a tight gap: where in it to go is searched from tight_clearance to this past the preferred shift, in these steps
+TIGHT_BEYOND = 0.15
+TIGHT_STEP = 0.02
+ON_TRACK = 1e-3   # m: the least clearance of a path point: the map's clearance is 0 off the track
+# m^2: a patch of the map inside the track this small, with no occupied cell, is track the lidar did not see
+# during mapping, not a wall (porto: 75 and 200 cm^2, 7 cm from the raceline, refused every path passing it)
+UNKNOWN_SPECK_AREA = 0.05
+# Every path starts at the car: its offset from the raceline at the car blends into the planned one over this
+# many m (or by the obstacle, if nearer), and the points this far behind the car hold it, for pure pursuit
+FROM_CAR_BLEND = 1.5
+BEHIND_CAR = 1.0
+# m ahead of the car not checked for clearance: the car is already there, and has to be able to drive out
+CAR_EXEMPT = 0.3
+# A pass being driven is kept, not planned again each tick: a tight path sits at its clearance limit, so scan noise
+# would flip it between fits and does not, and each refusal would stop the car (it inches). m: what it must clear to
+# go on when nothing else fits, half the car (from the walls) and a few cm more (from the obstacle)
+HOLD_WALL = 0.135
+HOLD_OBSTACLE = 0.165
+DRIVEN_GAP = 0.4   # s without a scan after which a pass is forgotten
+OFF_LINE = 0.2   # m: the car this far from the raceline is off it (95 % localization error: ~0.07, worst ~0.18)
+# m past the obstacle where a pass line may rejoin the raceline (mintime segments rejoin 2-11 m past it, porto 2026-11-01);
+# the tight-gap search tries SEARCH_TAIL only, then all of them at the best position
+PASS_TAILS = (2.5, 4.0, 6.0, 8.0, 10.0, 13.0)
+SEARCH_TAIL = 6.0
+SEARCH_EVERY = 3   # of the tight-gap positions: a solve and a clearance check each, and the node has one thread
+CORRIDOR_REACH, CORRIDOR_STEP = 3.0, 0.02   # m: how far beside the raceline the track is looked for, and in what steps
+INSIDE_TURN = 0.9        # of the turn's radius: an offset this far inside a corner, no further (its normals meet there)
+NOSE = 0.3               # m: the goal offset is reached this far before the obstacle: the car's nose is ahead of base_link
+OVER_GRIP_COST = 0.05    # s per m/s^2 over the raceline's lateral limit at its speeds: pure pursuit keeps those speeds
 MAX_SPEED = 15.0   # m/s: the pose moving faster between ticks is a reset (a teleport): nothing is carried
+
+
+def fill_unknown_specks(track, occupied, res):
+    """track (bool cells) with its small enclosed patches that hold no occupied cell filled in."""
+    patches, count = label(~track)
+    if not count:
+        return track
+    edge = np.unique(np.r_[patches[0], patches[-1], patches[:, 0], patches[:, -1]])
+    area = np.bincount(patches.ravel(), minlength=count + 1) * res * res
+    walled = np.bincount(patches.ravel(), weights=occupied.ravel(), minlength=count + 1) > 0
+    fill = (area <= UNKNOWN_SPECK_AREA) & ~walled
+    fill[0] = False
+    fill[edge] = False
+    return track | fill[patches]
 
 
 def yaw_of(q):
@@ -112,6 +187,8 @@ class ObstacleSpliner(Node):
         self.obstacle_length = float(p('obstacle_length', 0.5).value)   # m behind the visible face
         self.half_width = float(p('vehicle_half_width', 0.17).value)
         self.margin = float(p('safety_margin', 0.16).value)
+        # m from walls and obstacle to the car's centre in a tight gap: half the car + 95 % localization error
+        self.tight_clearance = float(p('tight_clearance', 0.205).value)
         self.wall_clearance = float(p('wall_clearance', 0.12).value)   # m: localization error + a map cell
         # deg: Cartographer's heading error, 95th percentile against sim ground truth (2026-10-25)
         self.heading_tolerance = math.radians(float(p('heading_tolerance', 1.0).value))
@@ -134,11 +211,13 @@ class ObstacleSpliner(Node):
         # scan alone) walls come back as obstacles: 8 and 3 stops a lap
         self.max_align_shift = float(p('max_align_shift', 0.3).value)
         self.max_align_turn = math.radians(float(p('max_align_turn', 6.0).value))
+        self.use_pass_line = bool(p('pass_line', True).value)   # False: the eased shift only
         rate = float(p('rate_hz', 15.0).value)
         if not raceline_path or not map_yaml:
             raise ValueError('Set the raceline_path and map_yaml parameters')
 
-        xy = read_raceline(raceline_path)[:, 1:3]
+        rows = read_raceline(raceline_path)
+        xy = rows[:, 1:3]
         if np.linalg.norm(xy[0] - xy[-1]) < 1e-5:
             xy = xy[:-1]   # TUM closes the loop by repeating the first row
         if len(xy) < 6:
@@ -155,7 +234,7 @@ class ObstacleSpliner(Node):
         regions, _ = label(self.map.free)
         rc = np.rint(self.map.to_pixel(xy)).astype(int)
         on_line = regions[np.clip(rc[:, 0], 0, self.map.h - 1), np.clip(rc[:, 1], 0, self.map.w - 1)]
-        track = np.isin(regions, on_line[on_line > 0])
+        track = fill_unknown_specks(np.isin(regions, on_line[on_line > 0]), self.map.occupied, self.map.res)
         # to the track's edge: a free cell's centre is half a cell from the edge of the cell beyond it
         self.free_dist = np.maximum(distance_transform_edt(track) * self.map.res - self.map.res / 2, 0.0)
         # signed distance to the mapped walls' surface (negative inside them), and its gradient per cell
@@ -164,6 +243,16 @@ class ObstacleSpliner(Node):
                           + np.where(occupied, 0.5, -0.5) * self.map.res).astype(np.float32)
         self.wall_grad = [g.astype(np.float32) for g in np.gradient(self.wall_dist)]   # d/drow, d/dcol
         self.base_clear = self.clearances(self.base_xy)
+        self.base_kappa, self.base_v = rows[:self.n, 4], rows[:self.n, 5]
+        # what the raceline itself asks of the car: the limits of the speed profiles that compare pass lines
+        ax = rows[:self.n, 6]
+        self.a_lat = max(float(np.percentile(self.base_v ** 2 * np.abs(self.base_kappa), 99)), 1.0)
+        self.a_acc = max(float(np.percentile(ax, 99)), 0.5)
+        self.a_brake = max(float(-np.percentile(ax, 1)), 0.5)
+        beside = np.arange(-CORRIDOR_REACH, CORRIDOR_REACH + CORRIDOR_STEP / 2, CORRIDOR_STEP)
+        self.beside_clear = self.clearances((self.base_xy[:, None, :] + beside[None, :, None] * self.normal[:, None, :])
+                                            .reshape(-1, 2)).reshape(self.n, len(beside))
+        self.corridors = {}
         self.side = 0   # side of the last path: -1 right, 1 left, 0 none
 
         self.pose = self.scan = None
@@ -177,8 +266,12 @@ class ObstacleSpliner(Node):
         self.pose_jump = -math.inf   # stamp of the last start of the pose stream (after a gap, or time going back)
         # (scan stamp, correction, map -> odom then or None, car position) of the last tick
         self.last_align = None
+        self.driven, self.driven_stamp = None, None   # the pass being driven (offsets from the raceline), its last scan
         self.path_pub = self.create_publisher(Path, '/local_path', 10)
         self.valid_pub = self.create_publisher(Bool, '/local_path/valid', 10)
+        self.candidate_pubs = {-1: self.create_publisher(Path, '/local_path/candidate_right', 10),
+                               1: self.create_publisher(Path, '/local_path/candidate_left', 10)}
+        self.status_pub = self.create_publisher(String, '/local_path/candidate_status', 10)
         self.create_subscription(PoseStamped, pose_topic, self.pose_callback, 10)
         self.create_subscription(LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data)
         self.create_timer(1 / rate, self.tick)
@@ -463,22 +556,224 @@ class ObstacleSpliner(Node):
         out[fall] = d_goal * (1 - smoothstep((rel[fall] - hold_to) / self.end_distance))
         return out
 
+    def shift_from_car(self, rel, planned, ego_d, blend):
+        """The planned offsets (by rel, m ahead of the car), starting at the car's offset ego_d."""
+        out = planned.copy()
+        at_car = float(np.interp(0.0, rel[np.argsort(rel)], planned[np.argsort(rel)]))
+        ahead = (rel >= 0.0) & (rel < blend)
+        out[ahead] += (ego_d - at_car) * (1.0 - smoothstep(rel[ahead] / blend))
+        out[(rel < 0.0) & (rel >= -BEHIND_CAR)] = ego_d
+        return out
+
+    def corridor(self, wall):
+        """(lower, upper): at each raceline point, the offsets connected to the raceline that keep wall m from the
+        track's edge (the raceline's own clearance where that is smaller)."""
+        key = round(wall, 4)
+        if key not in self.corridors:
+            need = np.maximum(np.minimum(wall, self.base_clear - self.map.res), ON_TRACK)
+            ok = self.beside_clear >= need[:, None]
+            zero = (ok.shape[1] - 1) // 2
+            ok[:, zero] = True
+            left = np.logical_and.accumulate(ok[:, zero:], axis=1).sum(axis=1) - 1
+            right = np.logical_and.accumulate(ok[:, zero::-1], axis=1).sum(axis=1) - 1
+            inside = INSIDE_TURN / np.maximum(np.abs(self.base_kappa), 1e-3)
+            self.corridors[key] = (np.where(self.base_kappa < 0, np.maximum(-right * CORRIDOR_STEP, -inside),
+                                            -right * CORRIDOR_STEP),
+                                   np.where(self.base_kappa > 0, np.minimum(left * CORRIDOR_STEP, inside),
+                                            left * CORRIDOR_STEP))
+        return self.corridors[key]
+
+    def pass_offset(self, rel, start, side, goal, near, hold_to, wall, gap, points, tail):
+        """The pass line that rejoins tail m past hold_to: offsets at every raceline point, or None. start: (first
+        point ahead of the car, the car's offset, its d'). goal: the offset held from near to hold_to. points: (m
+        ahead of the car, offset) of the returns: gap m from each, on the side of the path it is on."""
+        first, ego_d, slope = start
+        reach = min(max(hold_to, 0.0) + tail, self.lap / 2 - 0.1)   # rel wraps at half a lap
+        ds = float(np.mean(self.seg))
+        count = int(reach / ds) + 1
+        if count < 8:
+            return None
+        idx = (first + np.arange(count)) % self.n
+        ahead = rel[first] + ds * np.arange(count)
+        lower, upper = self.corridor(wall)
+        lower, upper = lower[idx].copy(), upper[idx].copy()
+        along, across = points
+        if len(along):
+            lag = ahead[:, None] - along[None, :]
+            near_it = np.abs(lag) < gap
+            chord = np.sqrt(np.maximum(gap ** 2 - lag ** 2, 0.0))
+            passed = (across - goal) * side <= 0.0   # a return beyond the goal is left on the far side
+            low, high = (passed, ~passed) if side > 0 else (~passed, passed)
+            lower = np.maximum(lower, np.max(np.where(near_it & low[None, :], across[None, :] + chord, -np.inf), axis=1))
+            upper = np.minimum(upper, np.min(np.where(near_it & high[None, :], across[None, :] - chord, np.inf), axis=1))
+        hold = (ahead >= near - NOSE) & (ahead <= hold_to)
+        if side > 0:
+            lower[hold] = np.maximum(lower[hold], goal)
+        else:
+            upper[hold] = np.minimum(upper[hold], goal)
+        free = ahead < CAR_EXEMPT                  # the car is already there, and has to be able to drive out
+        lower[free], upper[free] = -np.inf, np.inf
+        lower[0] = upper[0] = ego_d
+        solved = solve_offsets(ds, self.base_kappa[idx], self.base_v[idx], lower, upper, slope)
+        if solved is None:
+            return None
+        offset = np.zeros(self.n)
+        offset[(rel < 0.0) & (rel >= -BEHIND_CAR)] = ego_d
+        offset[idx] = solved
+        return offset
+
+    def by_time_lost(self, first, offsets):
+        """The offsets (each at every raceline point), the one losing least time first: speed profiles along the longest
+        of them, plus OVER_GRIP_COST for lateral acceleration beyond the raceline's at its speeds."""
+        if len(offsets) < 2:
+            return offsets
+        length = max(int(np.max(np.flatnonzero((np.abs(np.roll(o, -first)) > 1e-9))) + 2) for o in offsets)
+        idx = (first + np.arange(min(length, self.n))) % self.n
+        paths = np.stack([self.base_xy[idx] + o[idx][:, None] * self.normal[idx] for o in offsets])
+        lost, _, _ = time_lost(paths, self.base_xy[idx], self.base_v[first], float(np.max(self.base_v)) + 1e-3,
+                               self.a_lat, self.a_acc, self.a_brake)
+        kappa = path_curvature(paths)[1]
+        over = np.max(np.abs(kappa[:, 3:-3]) * self.base_v[idx][3:-3] ** 2, axis=1, initial=0.0) - self.a_lat
+        return [offsets[i] for i in np.argsort(lost + OVER_GRIP_COST * np.maximum(over, 0.0))]
+
     def collision_free(self, path, moved, obstacle_xy):
         """Check every STEP m along the path's segments that have a moved end."""
+        return self.margin_of(path, moved, obstacle_xy,
+                              self.half_width + self.margin, self.half_width + self.margin / 2) >= 0.0
+
+    def margin_of(self, path, moved, obstacle_xy, wall, obstacle):
+        """How far the path stays beyond needing wall m from the walls (the raceline's own clearance where that
+        is smaller) and obstacle m from the obstacle's points: negative if it comes closer."""
         idx = np.flatnonzero(moved | np.roll(moved, -1))   # segment i runs from point i to i + 1
         a, b = path[idx], path[(idx + 1) % self.n]
         count = np.ceil(np.linalg.norm(b - a, axis=1) / STEP).astype(int) + 1
         seg = np.repeat(np.arange(len(idx)), count)
-        u = np.concatenate([np.linspace(0, 1, k) for k in count])
+        u = (np.arange(len(seg)) - np.r_[0, np.cumsum(count)[:-1]][seg]) / np.maximum(count[seg] - 1, 1)
         pts = a[seg] + u[:, None] * (b - a)[seg]
         i = idx[seg]
         raceline_clear = np.minimum(self.base_clear[i], self.base_clear[(i + 1) % self.n]) - self.map.res
-        if np.any(self.clearances(pts) < np.minimum(self.half_width + self.margin, raceline_clear)):
-            return False
+        # never off the track (clearance 0), also where the raceline itself runs within a map cell of its edge
+        spare = float(np.min(self.clearances(pts) - np.maximum(np.minimum(wall, raceline_clear), ON_TRACK)))
         if not len(obstacle_xy):
-            return True
+            return spare
         gap = np.min(np.linalg.norm(pts[:, None, :] - obstacle_xy[None, :, :], axis=2))
-        return gap >= self.half_width + self.margin / 2
+        return min(spare, float(gap - obstacle))
+
+    def pass_candidates(self, rel, near, far, d_right, d_left, obstacle_xy, beside=(), ego_d=None, slope=0.0):
+        """Each side's path: {side: (state 'ok' | 'tight' | 'rejected', |shift|, path, moved)}. 'ok' is the
+        preferred shift; a side without it is searched for a position in its gap ('tight'): past the obstacle, past
+        the other clusters beside it (beside: their (d_right, d_left)), or where the car is now (ego_d). slope: the
+        car's heading off the raceline, as d'."""
+        reach = self.half_width + self.margin
+        before = min(self.start_distance, max(0.65, near - 0.5))
+        blend = min(FROM_CAR_BLEND, near) if near >= 0.5 else 1.0
+
+        def path_of(goal):
+            offset = self.offsets(rel, goal, before, near, far + self.obstacle_length)
+            if ego_d is not None:
+                offset = self.shift_from_car(rel, offset, ego_d, blend)
+            return self.base_xy + offset[:, None] * self.normal, (np.abs(offset) > 1e-9) & (rel >= 0.0)
+
+        def checked(moved):
+            return moved & (rel >= CAR_EXEMPT)
+
+        first = int(np.argmin(np.where(rel >= 0.0, rel, np.inf)))
+        start = (first, 0.0 if ego_d is None else ego_d, slope)
+        hold_to = far + self.obstacle_length
+        points = (np.empty(0), np.empty(0))
+        if self.use_pass_line and len(obstacle_xy):
+            s_pts, d_pts, _ = self.project(obstacle_xy)
+            ego_s = self.s[first] - rel[first]
+            points = ((s_pts - ego_s + self.lap / 2) % self.lap - self.lap / 2, d_pts)
+
+        def line_of(side, goal, wall, gap, tails, accept=None):
+            """The clear pass line for this goal losing least time: (path, moved), or None. It is planned gap m from
+            the obstacle's points and has to keep accept m (default gap): a held path has that much to spare."""
+            lines = [self.pass_offset(rel, start, side, goal, near, hold_to, wall, gap, points, tail) for tail in tails]
+            lines = [offset for offset in lines if offset is not None]
+            for offset in self.by_time_lost(first, lines):   # the clearance check is the costly part: least lost first
+                path = self.base_xy + offset[:, None] * self.normal
+                moved = (np.abs(offset) > 1e-9) & (rel >= 0.0)
+                if self.margin_of(path, checked(moved), obstacle_xy, wall, gap if accept is None else accept) >= 0.0:
+                    return path, moved
+            return None
+
+        out = {}
+        edges = {-1: d_right, 1: d_left}
+        for side, edge in edges.items():
+            goal = edge + side * reach
+            line = None
+            if self.use_pass_line:
+                line = line_of(side, goal, reach, reach, PASS_TAILS, self.half_width + self.margin / 2)
+            if line is not None:
+                out[side] = ('ok', abs(goal), line[0], line[1])
+                continue
+            path, moved = path_of(goal)
+            state = 'ok' if self.collision_free(path, checked(moved), obstacle_xy) else 'rejected'
+            out[side] = (state, abs(goal), path, moved)
+        for side, edge in edges.items():
+            if out[side][0] == 'ok':
+                continue
+            best = None
+            pasts = np.arange(self.tight_clearance, reach + TIGHT_BEYOND + 1e-6, TIGHT_STEP)
+            goals = [edge + side * past for past in pasts]
+            for right, left in beside:
+                other = left if side > 0 else right
+                if (other - edge) * side > 0:
+                    goals += [other + side * past for past in pasts]
+            if ego_d is not None and (ego_d - edge) * side > 0:
+                goals.append(ego_d)     # already past it on this side: staying there is the first thing to try
+            if self.use_pass_line:
+                tight = self.tight_clearance
+                for goal in goals[::SEARCH_EVERY]:
+                    line = line_of(side, goal, tight, tight, (SEARCH_TAIL,))
+                    if line is not None:
+                        spare = self.margin_of(line[0], checked(line[1]), obstacle_xy, tight, tight)
+                        if best is None or spare > best[0]:
+                            best = (spare, goal)
+                if best is not None:
+                    line = line_of(side, best[1], tight, tight, PASS_TAILS)
+                    out[side] = ('tight', abs(best[1]), line[0], line[1])
+                    continue
+            for goal in goals:
+                path, moved = path_of(goal)
+                spare = self.margin_of(path, checked(moved), obstacle_xy, self.tight_clearance, self.tight_clearance)
+                if spare >= 0.0 and (best is None or spare > best[0]):
+                    best = (spare, abs(goal), path, moved)
+            if best is not None:
+                out[side] = ('tight', best[1], best[2], best[3])
+        return out
+
+    def kept_on_track(self, path):
+        """A refused candidate as published: each point pulled back towards the raceline until it is on the track
+        with tight_clearance (or the raceline's own clearance). For inspection only, nothing steers on it."""
+        offset = path - self.base_xy
+        need = np.maximum(np.minimum(self.tight_clearance, self.base_clear), ON_TRACK)
+        fit = np.zeros(self.n)
+        for f in np.linspace(0.05, 1.0, 20):
+            fit = np.where(self.clearances(self.base_xy + f * offset) >= need, f, fit)
+        return self.base_xy + fit[:, None] * offset
+
+    def publish_candidates(self, candidates=None):
+        names = {-1: 'right', 1: 'left'}
+        states = []
+        for side, pub in self.candidate_pubs.items():
+            msg = Path()
+            msg.header.frame_id = 'map'
+            msg.header.stamp = self.get_clock().now().to_msg()
+            if candidates and side in candidates:
+                state, _, path, moved = candidates[side]
+                states.append(f'{names[side]}={state}')
+                if state == 'rejected':
+                    path = self.kept_on_track(path)
+                for x, y in path[moved | np.roll(moved, -1) | np.roll(moved, 1)]:
+                    pose = PoseStamped()
+                    pose.header = msg.header
+                    pose.pose.position.x, pose.pose.position.y = float(x), float(y)
+                    pose.pose.orientation.w = 1.0
+                    msg.poses.append(pose)
+            pub.publish(msg)
+        self.status_pub.publish(String(data=' '.join(states)))
 
     def publish(self, xy, valid):
         msg = Path()
@@ -520,36 +815,114 @@ class ObstacleSpliner(Node):
         clusters = self.scan_clusters(scan, pose)
         reach = self.half_width + self.margin
         # in the car's way: a point within reach of the raceline, from lookahead ahead until the car is past
-        blocking = []
+        blocking, others = [], []
         for xy in clusters:
             s_pts, d_pts, dist = self.project(xy)
             ahead = (s_pts - ego_s + self.lap / 2) % self.lap - self.lap / 2
             near, far = ahead.min(), ahead.max()
-            if (dist < reach).any() and near < self.lookahead \
+            if (dist < self.tight_clearance).any() and near < self.lookahead \
                     and far + self.obstacle_length + self.half_width > 0:
-                blocking.append((near, far, d_pts.min(), d_pts.max()))
-        if not blocking:
+                blocking.append((near, far, d_pts.min(), d_pts.max(), (dist < self.tight_clearance).any()))
+            else:
+                others.append((near, far, d_pts.min(), d_pts.max()))
+        rel = (self.s - ego_s + self.lap / 2) % self.lap - self.lap / 2
+        ego_d = float(self.project([position.x, position.y])[1][0])
+        stamp = seconds(scan.header.stamp)
+        first = int(np.argmin(np.where(rel >= 0.0, rel, np.inf)))
+        off_line = yaw_of(self.pose.pose.orientation) - math.atan2(self.tan[first, 1], self.tan[first, 0])
+        slope = float(np.clip(math.tan(math.atan2(math.sin(off_line), abs(math.cos(off_line)) + 1e-6)), -0.5, 0.5))
+        if self.driven is not None:
+            self.driven[rel < -BEHIND_CAR] = 0.0   # a pass is driven once: what the car has passed is done
+
+        def back_on_raceline():
+            """From the car onto the raceline: the gentlest blend clear of walls and every cluster, else the raceline
+            itself (pure pursuit then closes the gap, as it does for any offset)."""
             self.side = 0
+            self.driven = None
+            if abs(ego_d) < OFF_LINE:
+                return self.publish(self.base_xy, True)
+            seen = np.vstack(clusters) if clusters else np.empty((0, 2))
+            for blend in (self.end_distance, 1.5, 1.0, 0.6):
+                offset = self.shift_from_car(rel, np.zeros(self.n), ego_d, blend)
+                path = self.base_xy + offset[:, None] * self.normal
+                checked = (np.abs(offset) > 1e-9) & (rel >= CAR_EXEMPT)
+                if self.margin_of(path, checked, seen, self.tight_clearance, self.tight_clearance) >= 0.0:
+                    return self.publish(path, True)
             return self.publish(self.base_xy, True)
+
+        def follow_return():
+            """The obstacle is behind the car: on along the pass being driven until it has rejoined the raceline."""
+            if (not self.use_pass_line or self.driven is None or not 0.0 <= stamp - self.driven_stamp <= DRIVEN_GAP
+                    or np.max(np.abs(self.driven[rel >= 0.0]), initial=0.0) < 0.02):
+                return False
+            offset = self.shift_from_car(rel, self.driven, ego_d, 1.0)
+            path, moved = self.base_xy + offset[:, None] * self.normal, (np.abs(offset) > 1e-9) & (rel >= CAR_EXEMPT)
+            seen = np.vstack(clusters) if clusters else np.empty((0, 2))
+            if self.margin_of(path, moved, seen, self.tight_clearance, self.tight_clearance) < 0.0:
+                return False
+            self.driven_stamp = stamp
+            self.publish(path, True)
+            return True
+
+        if not blocking:
+            self.publish_candidates()
+            if follow_return():
+                return None
+            return back_on_raceline()
         blocking.sort()
-        near, far, d_right, d_left = blocking[0]
-        for near_k, far_k, right_k, left_k in blocking[1:]:   # in the way before the pass ends: pass them too
+        near, far, d_right, d_left, on_line = blocking[0]
+        for near_k, far_k, right_k, left_k, on_line_k in blocking[1:]:   # in the way before the pass ends: pass them too
             if near_k <= far + self.obstacle_length:
                 far, d_right, d_left = max(far, far_k), min(d_right, right_k), max(d_left, left_k)
+                on_line = on_line or on_line_k
 
-        rel = (self.s - ego_s + self.lap / 2) % self.lap - self.lap / 2
-        before = min(self.start_distance, max(0.65, near - 0.5))
         obstacle_xy = np.vstack(clusters)
-        options = []
-        for side, d_goal in ((-1, d_right - reach), (1, d_left + reach)):
-            offset = self.offsets(rel, d_goal, before, near, far + self.obstacle_length)
-            path = self.base_xy + offset[:, None] * self.normal
-            if self.collision_free(path, np.abs(offset) > 1e-9, obstacle_xy):
-                options.append((side != self.side, abs(d_goal), side, path))
+        hold_to = far + self.obstacle_length
+        # the pass being driven, from where the car is now
+        held = None
+        if self.driven is not None and 0.0 <= stamp - self.driven_stamp <= DRIVEN_GAP:
+            offset = self.shift_from_car(rel, self.driven, ego_d, 1.0)
+            held = (self.base_xy + offset[:, None] * self.normal, (np.abs(offset) > 1e-9) & (rel >= CAR_EXEMPT))
+
+        def keep_held(wall, obstacle):
+            if held is None or self.margin_of(*held, obstacle_xy, wall, obstacle) < 0.0:
+                return False
+            self.driven_stamp = stamp
+            self.publish(held[0], True)
+            return True
+
+        # kept with full clearance: nothing to plan (this node has one thread: a late tick delays its poses)
+        if on_line and keep_held(reach, self.half_width + self.margin / 2):
+            self.publish_candidates({self.side: ('ok', 0.0, held[0], held[1])})
+            return None
+        beside = [(r, l) for n, f, r, l in others if n <= hold_to and f >= near]
+        candidates = self.pass_candidates(rel, near, far, d_right, d_left, obstacle_xy, beside, ego_d, slope)
+        if not on_line:
+            away = -1 if d_right > 0 else 1
+            nudge = candidates[away]
+            self.publish_candidates({away: nudge} if nudge[0] == 'ok' else {})
+            if nudge[0] != 'ok':
+                return back_on_raceline()
+            self.side, self.driven = away, None
+            return self.publish(nudge[2], True)
+        self.publish_candidates(candidates)
+        # the side being driven, then a side with room, then the smaller shift
+        options = [(side != self.side, c[0] == 'tight', c[1], side, c[2]) for side, c in candidates.items()
+                   if c[0] != 'rejected']
+        # a path with full clearance; else kept tight; else a tight path; else kept while it physically clears
+        # everything; only then stopped
+        roomy = [o for o in options if not o[1]]
+        if not roomy and keep_held(self.tight_clearance, self.tight_clearance):
+            return
+        options = roomy or options
         if not options:
+            if keep_held(HOLD_WALL, HOLD_OBSTACLE):
+                return
             self.get_logger().warning('no collision-free side around the obstacle', throttle_duration_sec=1.0)
+            self.driven = None
             return self.publish(self.base_xy, False)
-        _, _, self.side, path = min(options, key=lambda o: o[:2])
+        _, _, _, self.side, path = min(options, key=lambda o: o[:3])
+        self.driven, self.driven_stamp = np.sum((path - self.base_xy) * self.normal, axis=1), stamp
         self.publish(path, True)
 
 

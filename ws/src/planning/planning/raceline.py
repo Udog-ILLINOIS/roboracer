@@ -39,36 +39,63 @@ class OptimizationError(RuntimeError):
         self.ipopt_exit = ipopt_exit
 
 
-def run_mintime(centerline_csv, ini_path, python=TUM_PYTHON):
-    """Optimize; returns (trajectory Nx7, runtime s, IPOPT's EXIT message). Raises OptimizationError on failure."""
+def ipopt_exit_message(log):
+    """IPOPT's EXIT message in a TUM log (e.g. 'Optimal Solution Found.'), None if it has none."""
+    m = re.search(r'^EXIT: (.*)$', log, re.M)
+    return m.group(1).strip() if m else None
+
+
+def check_venv(python=TUM_PYTHON):
     if not os.path.isfile(python):
         raise OptimizationError(f'TUM venv python not found at {python} (built by the Dockerfile, '
                                 'see ws/src/planning/docker/install_deps.sh)')
+
+
+def run_in_venv(script, args, out, python=TUM_PYTHON, show=None, name=None):
+    """Run one of our scripts in the TUM venv; returns (log, runtime s). show(log), if given, sees its whole
+    output first. Raises OptimizationError if it fails (exit code != 0 or no output file `out`), with the last
+    lines of its output, summary = why (name, default the script's file name, '... failed (exit code n)' or
+    'IPOPT did not converge') and IPOPT's EXIT message."""
+    check_venv(python)
+    # -I: ignore ROS's PYTHONPATH so only the venv's packages are used
+    env = dict(os.environ, MPLBACKEND='Agg', TUM_DIR=TUM_DIR)
+    t0 = time.monotonic()
+    proc = subprocess.run([python, '-I', script, *args], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
+    dt = time.monotonic() - t0
+    log = proc.stdout
+    if show:
+        show(log)
+    if proc.returncode != 0 or not os.path.isfile(out):
+        tail = '\n'.join(log.splitlines()[-25:])
+        if 'EXIT: Optimal Solution Found' not in log and 'EXIT:' in log:
+            why = 'IPOPT did not converge'
+        else:
+            why = f'{name or os.path.basename(script)} failed (exit code {proc.returncode})'
+        raise OptimizationError(f'{why}. Last output:\n{tail}', summary=why, ipopt_exit=ipopt_exit_message(log))
+    return log, dt
+
+
+def print_tum_summary(log):
+    # IPOPT's iteration table is long; keep the summary lines
+    for line in log.splitlines():
+        line = re.sub(r'\x1b\[[0-9;]*m', '', line)   # TUM colours its ERROR / WARNING lines
+        if line.startswith(('INFO', 'WARNING', 'EXIT', 'Spline', 'Number of Iterations',
+                            'Total seconds', 'ERROR')):
+            print('  [tum] ' + line)
+
+
+def run_mintime(centerline_csv, ini_path, python=TUM_PYTHON):
+    """Optimize; returns (trajectory Nx7, runtime s, IPOPT's EXIT message). Raises OptimizationError on failure."""
+    check_venv(python)
     with tempfile.TemporaryDirectory(prefix='mintime_') as work:
         out = os.path.join(work, 'traj_race_cl.csv')
-        # -I: ignore ROS's PYTHONPATH so only the venv's packages are used
-        cmd = [python, '-I', DRIVER, centerline_csv, ini_path, out, work]
-        env = dict(os.environ, MPLBACKEND='Agg', TUM_DIR=TUM_DIR)
-        t0 = time.monotonic()
-        proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        dt = time.monotonic() - t0
-        log = proc.stdout
-        ipopt_exit = re.search(r'^EXIT: (.*)$', log, re.M)
-        ipopt_exit = ipopt_exit.group(1).strip() if ipopt_exit else None
-        # IPOPT's iteration table is long; keep the summary lines
-        for line in log.splitlines():
-            line = re.sub(r'\x1b\[[0-9;]*m', '', line)   # TUM colours its ERROR / WARNING lines
-            if line.startswith(('INFO', 'WARNING', 'EXIT', 'Spline', 'Number of Iterations',
-                                'Total seconds', 'ERROR')):
-                print('  [tum] ' + line)
-        if proc.returncode != 0 or not os.path.isfile(out):
-            tail = '\n'.join(log.splitlines()[-25:])
-            if 'EXIT: Optimal Solution Found' not in log and 'EXIT:' in log:
-                why = 'IPOPT did not converge'
-            else:
-                why = f'optimizer failed (exit code {proc.returncode})'
-            raise OptimizationError(f'mintime {why}. Last output:\n{tail}', summary=f'mintime {why}',
-                                    ipopt_exit=ipopt_exit)
+        try:
+            log, dt = run_in_venv(DRIVER, [centerline_csv, ini_path, out, work], out, python=python,
+                                  show=print_tum_summary, name='optimizer')
+        except OptimizationError as e:
+            raise OptimizationError(f'mintime {e}', summary=f'mintime {e.summary}', ipopt_exit=e.ipopt_exit)
+        ipopt_exit = ipopt_exit_message(log)
         try:
             traj = np.loadtxt(out, comments='#', delimiter=';', ndmin=2)
         except ValueError as e:

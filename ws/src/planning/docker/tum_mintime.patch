@@ -1,8 +1,120 @@
 diff --git a/opt_mintime_traj/src/opt_mintime.py b/opt_mintime_traj/src/opt_mintime.py
-index cd5b755..ab5b081 100644
+index cd5b755..d598cf2 100644
 --- a/opt_mintime_traj/src/opt_mintime.py
 +++ b/opt_mintime_traj/src/opt_mintime.py
-@@ -187,9 +187,12 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -1,3 +1,4 @@
++import json
+ import os
+ import sys
+ import time
+@@ -6,6 +7,9 @@ import casadi as ca
+ import opt_mintime_traj
+ import trajectory_planning_helpers as tph
+ 
++# IPOPT solvers of open segments, by length and options (our patch, see opt_mintime's segment option)
++_SEGMENT_SOLVERS = {}
++
+ 
+ def opt_mintime(reftrack: np.ndarray,
+                 coeffs_x: np.ndarray,
+@@ -65,6 +69,22 @@ def opt_mintime(reftrack: np.ndarray,
+ 
+     no_points_orig = reftrack.shape[0]
+ 
++    # open segment instead of a closed lap (our patch, used by the SIGRobotics planning/tum_segment.py):
++    #   kappa:  curvature of the reference line at every point, computed by the caller on the closed track
++    #   x0:     fixed first state [v, beta, omega_z, n, xi] (unscaled)
++    #   x_end:  target for the last state, pulled towards by the terminal cost sum(w_end * (x_N - x_end)^2) in
++    #           scaled units, instead of the closed-lap constraint first state = last state
++    #   delta0: the car's steering angle now [rad]; the first steering change obeys the t_delta rate limit from it
++    #   x_guess (optional): initial guess of the states at every point, (no_points x 5)
++    #   ipopt (optional):   extra solver options
++    # The track is not closed, the solver does not exit the process on failure, and a dict is returned.
++    # kappa, x_end, w_end and delta0 are NLP parameters and widths, x0 and x_guess are bounds and the initial
++    # point, so the IPOPT solver depends only on the number of points: it is built once per length (and solver
++    # options) and reused from _SEGMENT_SOLVERS for as long as the process runs.
++    seg = pars["optim_opts"].get("segment")
++    if seg is not None and (pars["optim_opts"]["step_non_reg"] > 0 or pars["pwr_params_mintime"]["pwr_behavior"]):
++        raise ValueError("segment: needs step_non_reg = 0 and pwr_behavior = false")
++
+     if pars["optim_opts"]["step_non_reg"] > 0:
+         reftrack, discr_points = tph.nonreg_sampling.nonreg_sampling(track=reftrack,
+                                                                      eps_kappa=pars["optim_opts"]["eps_kappa"],
+@@ -82,25 +102,34 @@ def opt_mintime(reftrack: np.ndarray,
+     # PREPARE TRACK INFORMATION ----------------------------------------------------------------------------------------
+     # ------------------------------------------------------------------------------------------------------------------
+ 
+-    # spline lengths
+-    spline_lengths_refline = tph.calc_spline_lengths.calc_spline_lengths(coeffs_x=coeffs_x,
+-                                                                         coeffs_y=coeffs_y)
+-
+-    # calculate heading and curvature (numerically)
+-    kappa_refline = tph.calc_head_curv_num. \
+-        calc_head_curv_num(path=reftrack[:, :2],
+-                           el_lengths=spline_lengths_refline,
+-                           is_closed=True,
+-                           stepsize_curv_preview=pars["curv_calc_opts"]["d_preview_curv"],
+-                           stepsize_curv_review=pars["curv_calc_opts"]["d_review_curv"],
+-                           stepsize_psi_preview=pars["curv_calc_opts"]["d_preview_head"],
+-                           stepsize_psi_review=pars["curv_calc_opts"]["d_review_head"])[1]
+-
+-    # close track
+-    kappa_refline_cl = np.append(kappa_refline, kappa_refline[0])
+-    discr_points_cl = np.append(discr_points, no_points_orig)  # add virtual index of last/first point for closed track
+-    w_tr_left_cl = np.append(reftrack[:, 3], reftrack[0, 3])
+-    w_tr_right_cl = np.append(reftrack[:, 2], reftrack[0, 2])
++    if seg is None:
++        # spline lengths
++        spline_lengths_refline = tph.calc_spline_lengths.calc_spline_lengths(coeffs_x=coeffs_x,
++                                                                             coeffs_y=coeffs_y)
++
++        # calculate heading and curvature (numerically)
++        kappa_refline = tph.calc_head_curv_num. \
++            calc_head_curv_num(path=reftrack[:, :2],
++                               el_lengths=spline_lengths_refline,
++                               is_closed=True,
++                               stepsize_curv_preview=pars["curv_calc_opts"]["d_preview_curv"],
++                               stepsize_curv_review=pars["curv_calc_opts"]["d_review_curv"],
++                               stepsize_psi_preview=pars["curv_calc_opts"]["d_preview_head"],
++                               stepsize_psi_review=pars["curv_calc_opts"]["d_review_head"])[1]
++
++        # close track
++        kappa_refline_cl = np.append(kappa_refline, kappa_refline[0])
++        discr_points_cl = np.append(discr_points, no_points_orig)  # add virtual index of last/first point for closed track
++        w_tr_left_cl = np.append(reftrack[:, 3], reftrack[0, 3])
++        w_tr_right_cl = np.append(reftrack[:, 2], reftrack[0, 2])
++    else:
++        # open segment: the last point is the end, nothing wraps around
++        kappa_refline_cl = np.asarray(seg["kappa"], dtype=float)
++        if kappa_refline_cl.size != no_points_orig:
++            raise ValueError("segment: kappa must hold one value per reftrack point")
++        discr_points_cl = discr_points
++        w_tr_left_cl = reftrack[:, 3]
++        w_tr_right_cl = reftrack[:, 2]
+ 
+     # step size along the reference line
+     h = pars["stepsize_opts"]["stepsize_reg"]
+@@ -119,6 +148,19 @@ def opt_mintime(reftrack: np.ndarray,
+     # interpolate curvature of reference line in terms of steps
+     kappa_interp = ca.interpolant('kappa_interp', 'linear', [steps], kappa_refline_cl)
+ 
++    if seg is not None:
++        # parameters P = [kappa at every point, x_end (scaled), w_end, delta0 (scaled)] (see above)
++        P = ca.MX.sym('P', N + 1 + 5 + 5 + 1)
++        kappa_p, x_end_p, w_end_p, delta0_p = P[:N + 1], P[N + 1:N + 6], P[N + 6:N + 11], P[N + 11]
++
++        def kappa_at(k_frac):
++            # = the linear interpolant above, of the curvature parameter
++            k0 = int(np.floor(k_frac))
++            u = k_frac - k0
++            return kappa_p[k0] if u == 0 else (1 - u) * kappa_p[k0] + u * kappa_p[k0 + 1]
++    else:
++        kappa_at = kappa_interp
++
+     # interpolate track width (left and right to reference line) in terms of steps
+     w_tr_left_interp = ca.interpolant('w_tr_left_interp', 'linear', [steps], w_tr_left_cl)
+     w_tr_right_interp = ca.interpolant('w_tr_right_interp', 'linear', [steps], w_tr_right_cl)
+@@ -187,9 +229,12 @@ def opt_mintime(reftrack: np.ndarray,
          nx = 5
          nx_pwr = 0
  
@@ -16,7 +128,7 @@ index cd5b755..ab5b081 100644
      v = v_s * v_n
  
      # side slip angle [rad]
-@@ -199,12 +202,12 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -199,12 +244,12 @@ def opt_mintime(reftrack: np.ndarray,
  
      # yaw rate [rad/s]
      omega_z_n = ca.SX.sym('omega_z_n')
@@ -31,7 +143,7 @@ index cd5b755..ab5b081 100644
      n = n_s * n_n
  
      # relative angle to tangent on reference line [rad]
-@@ -258,17 +261,17 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -258,17 +303,17 @@ def opt_mintime(reftrack: np.ndarray,
  
      # positive longitudinal force (drive) [N]
      f_drive_n = ca.SX.sym('f_drive_n')
@@ -52,7 +164,7 @@ index cd5b755..ab5b081 100644
      gamma_y = gamma_y_s * gamma_y_n
  
      # scaling factors for control variables
-@@ -434,7 +437,7 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -434,7 +479,7 @@ def opt_mintime(reftrack: np.ndarray,
                                      + ((f_x_fr - f_x_fl) * ca.cos(delta)
                                         + (f_y_fl - f_y_fr) * ca.sin(delta)) * veh["track_width_front"] / 2
                                      + ((f_y_fl + f_y_fr) * ca.cos(delta)
@@ -61,7 +173,7 @@ index cd5b755..ab5b081 100644
  
      dn = sf * v * ca.sin(xi + beta)
  
-@@ -496,15 +499,15 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -496,15 +541,15 @@ def opt_mintime(reftrack: np.ndarray,
      v_max = pars["veh_params"]["v_max"] / v_s       # max. velocity [m/s]
      beta_min = -0.5 * np.pi / beta_s                # min. side slip angle [rad]
      beta_max = 0.5 * np.pi / beta_s                 # max. side slip angle [rad]
@@ -80,7 +192,7 @@ index cd5b755..ab5b081 100644
  
      # ------------------------------------------------------------------------------------------------------------------
      # HELPER FUNCTIONS -------------------------------------------------------------------------------------------------
-@@ -563,8 +566,8 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -563,8 +608,8 @@ def opt_mintime(reftrack: np.ndarray,
      # boundary constraint: lift initial conditions
      Xk = ca.MX.sym('X0', nx)
      w.append(Xk)
@@ -91,7 +203,50 @@ index cd5b755..ab5b081 100644
      if pars["pwr_params_mintime"]["pwr_behavior"]:
          lbw.append([v_min, beta_min, omega_z_min, n_min, xi_min,
                      machine.temp_min, batt.temp_min, inverter.temp_min,
-@@ -676,8 +679,8 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -608,8 +653,24 @@ def opt_mintime(reftrack: np.ndarray,
+         lbw.append([v_min, beta_min, omega_z_min, n_min, xi_min])
+         ubw.append([v_max, beta_max, omega_z_max, n_max, xi_max])
+         w0.append([v_guess, 0.0, 0.0, 0.0, 0.0])
++    if seg is not None:
++        # boundary constraint: the first state is the car's
++        x_fix = np.asarray(seg["x0"], dtype=float) / x_s
++        lbw[-1] = x_fix
++        ubw[-1] = x_fix
++        w0[-1] = x_fix
+     x_opt.append(Xk * x_s)
+ 
++    # seeded initial guess of the scaled states at (fractional) step k, linear between the points
++    if seg is not None and seg.get("x_guess") is not None:
++        x_guess = np.asarray(seg["x_guess"], dtype=float) / x_s
++        steps_guess = np.arange(x_guess.shape[0])
++
++        def guess(k_frac):
++            return [float(np.interp(k_frac, steps_guess, x_guess[:, i])) for i in range(nx)]
++    else:
++        guess = None
++
+     # loop along the racetrack and formulate path constraints & system dynamic
+     # retrieve step-sizes of optimization along reference line
+     h = np.diff(s_opt)
+@@ -634,6 +695,8 @@ def opt_mintime(reftrack: np.ndarray,
+                            machine.temp_guess, batt.temp_guess, inverter.temp_guess,
+                            radiators.temp_cool_mi_guess, radiators.temp_cool_b_guess,
+                            batt.soc_guess])
++            elif guess is not None:
++                w0.append(guess(k + tau[j + 1]))
+             else:
+                 w0.append([v_guess, 0.0, 0.0, 0.0, 0.0])
+ 
+@@ -647,7 +710,7 @@ def opt_mintime(reftrack: np.ndarray,
+                 xp = xp + C[r + 1, j] * Xc[r]
+ 
+             # interpolate kappa at the collocation point
+-            kappa_col = kappa_interp(k + tau[j])
++            kappa_col = kappa_at(k + tau[j])
+ 
+             # append collocation equations (system dynamic)
+             fj, qj = f_dyn(Xc[j - 1], Uk, kappa_col)
+@@ -676,8 +739,8 @@ def opt_mintime(reftrack: np.ndarray,
          # add new decision variables for state at end of the collocation interval
          Xk = ca.MX.sym('X_' + str(k + 1), nx)
          w.append(Xk)
@@ -102,7 +257,16 @@ index cd5b755..ab5b081 100644
          if pars["pwr_params_mintime"]["pwr_behavior"]:
              lbw.append([v_min, beta_min, omega_z_min, n_min, xi_min,
                          machine.temp_min, batt.temp_min, inverter.temp_min,
-@@ -766,7 +769,7 @@ def opt_mintime(reftrack: np.ndarray,
+@@ -694,7 +757,7 @@ def opt_mintime(reftrack: np.ndarray,
+         else:
+             lbw.append([v_min, beta_min, omega_z_min, n_min, xi_min])
+             ubw.append([v_max, beta_max, omega_z_max, n_max, xi_max])
+-            w0.append([v_guess, 0.0, 0.0, 0.0, 0.0])
++            w0.append(guess(k + 1) if guess is not None else [v_guess, 0.0, 0.0, 0.0, 0.0])
+ 
+         # add equality constraint
+         g.append(Xk_end - Xk)
+@@ -766,28 +829,35 @@ def opt_mintime(reftrack: np.ndarray,
  
          # path constraint: f_drive * f_brake == 0 (no simultaneous operation of brake and accelerator pedal)
          g.append(Uk[1] * Uk[2])
@@ -111,8 +275,18 @@ index cd5b755..ab5b081 100644
          ubg.append([0.0])
  
          # path constraint: actor dynamic
-@@ -777,17 +780,18 @@ def opt_mintime(reftrack: np.ndarray,
+         if k > 0:
+-            sigma = (1 - kappa_interp(k) * Xk[3] * n_s) / (Xk[0] * v_s)
++            sigma = (1 - kappa_at(k) * Xk[3] * n_s) / (Xk[0] * v_s)
+             g.append((Uk - w[1 + (k - 1) * (nx - nx_pwr)]) / (h[k - 1] * sigma))
+             lbg.append([delta_min / (veh["t_delta"]), -np.inf, f_brake_min / (veh["t_brake"]), -np.inf])
              ubg.append([delta_max / (veh["t_delta"]), f_drive_max / (veh["t_drive"]), np.inf, np.inf])
++        elif seg is not None:
++            # open segment: the first steering change starts from the car's steering, same rate limit
++            sigma = (1 - kappa_at(k) * Xk[3] * n_s) / (Xk[0] * v_s)
++            g.append((Uk[0] - delta0_p) / (h[k] * sigma))
++            lbg.append([delta_min / (veh["t_delta"])])
++            ubg.append([delta_max / (veh["t_delta"])])
  
          # path constraint: safe trajectories with acceleration ellipse
 +        # (one row, the same feasible set as upstream's two rows, one per sign of ax: with two rows IPOPT
@@ -135,3 +309,128 @@ index cd5b755..ab5b081 100644
  
          # append outputs
          x_opt.append(Xk * x_s)
+@@ -803,14 +873,18 @@ def opt_mintime(reftrack: np.ndarray,
+             batt.p_losses_opt.extend(batt.f_nlp(Xk, Uk))
+             radiators.temps_opt.extend(radiators.f_nlp(Xk, Uk))
+ 
+-    # boundary constraint: start states = final states
+-    g.append(w[0] - Xk)
+-    if pars["pwr_params_mintime"]["pwr_behavior"]:
+-        lbg.append([0.0, 0.0, 0.0, 0.0, 0.0, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf])
+-        ubg.append([0.0, 0.0, 0.0, 0.0, 0.0, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])
++    if seg is None:
++        # boundary constraint: start states = final states
++        g.append(w[0] - Xk)
++        if pars["pwr_params_mintime"]["pwr_behavior"]:
++            lbg.append([0.0, 0.0, 0.0, 0.0, 0.0, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf])
++            ubg.append([0.0, 0.0, 0.0, 0.0, 0.0, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])
++        else:
++            lbg.append([0.0, 0.0, 0.0, 0.0, 0.0])
++            ubg.append([0.0, 0.0, 0.0, 0.0, 0.0])
+     else:
+-        lbg.append([0.0, 0.0, 0.0, 0.0, 0.0])
+-        ubg.append([0.0, 0.0, 0.0, 0.0, 0.0])
++        # terminal cost: last state as close as possible to the target (scaled units)
++        J = J + ca.sum1(w_end_p * (Xk - x_end_p) ** 2)
+ 
+     # path constraint: limited energy consumption
+     if pars["optim_opts"]["limit_energy"]:
+@@ -822,7 +896,10 @@ def opt_mintime(reftrack: np.ndarray,
+     diff_matrix = np.eye(N)
+     for i in range(N - 1):
+         diff_matrix[i, i + 1] = -1.0
+-    diff_matrix[N - 1, 0] = -1.0
++    if seg is None:
++        diff_matrix[N - 1, 0] = -1.0
++    else:
++        diff_matrix = diff_matrix[:-1]  # open segment: no difference between the last and the first control
+ 
+     # regularization (delta)
+     delta_p = ca.vertcat(*delta_p)
+@@ -881,6 +958,8 @@ def opt_mintime(reftrack: np.ndarray,
+                            "ipopt.warm_start_slack_bound_push": 1e-3,
+                            "ipopt.mu_init": 1e-3}
+         opts.update(opts_warm_start)
++    if seg is not None:
++        opts.update(seg.get("ipopt", {}))
+ 
+     # load warm start files
+     if pars["optim_opts"]["warm_start"]:
+@@ -897,8 +976,21 @@ def opt_mintime(reftrack: np.ndarray,
+         print('\033[91m' + 'WARNING: Warm start files do not fit to the dimension of the NLP!' + '\033[0m')
+         sys.exit(1)
+ 
+-    # create solver instance
+-    solver = ca.nlpsol("solver", "ipopt", nlp, opts)
++    # create solver instance (open segment: reuse the one built for this length and these options)
++    if seg is not None:
++        nlp['p'] = P
++        p_val = np.concatenate((kappa_refline_cl, np.asarray(seg["x_end"], dtype=float) / x_s,
++                                np.asarray(seg["w_end"], dtype=float), [seg.get("delta0", 0.0) / delta_s]))
++        key = (N, float(h[0]), json.dumps({k: v for k, v in pars.items() if k != "optim_opts"}, sort_keys=True),
++               json.dumps({k: v for k, v in pars["optim_opts"].items() if k != "segment"}, sort_keys=True),
++               json.dumps(opts, sort_keys=True))
++        solver = _SEGMENT_SOLVERS.get(key)
++        cached = solver is not None
++        if solver is None:
++            solver = ca.nlpsol("solver", "ipopt", nlp, opts)
++            _SEGMENT_SOLVERS[key] = solver
++    else:
++        solver = ca.nlpsol("solver", "ipopt", nlp, opts)
+ 
+     # ------------------------------------------------------------------------------------------------------------------
+     # SOLVE NLP --------------------------------------------------------------------------------------------------------
+@@ -910,13 +1002,19 @@ def opt_mintime(reftrack: np.ndarray,
+     # solve NLP
+     if pars["optim_opts"]["warm_start"]:
+         sol = solver(x0=w0, lbx=lbw, ubx=ubw, lbg=lbg, ubg=ubg, lam_x0=lam_x0, lam_g0=lam_g0)
++    elif seg is not None:
++        sol = solver(x0=w0, lbx=lbw, ubx=ubw, lbg=lbg, ubg=ubg, p=p_val)
+     else:
+         sol = solver(x0=w0, lbx=lbw, ubx=ubw, lbg=lbg, ubg=ubg)
+ 
+     # end time measure
+     tend = time.perf_counter()
+ 
+-    if solver.stats()['return_status'] != 'Solve_Succeeded':
++    if seg is not None and solver.stats()['return_status'] not in ('Solve_Succeeded', 'Solved_To_Acceptable_Level'):
++        return {"success": False, "status": solver.stats()['return_status'],
++                "iterations": solver.stats()['iter_count'], "solve_time": tend - t0, "cached": cached}
++
++    if seg is None and solver.stats()['return_status'] != 'Solve_Succeeded':
+         print('\033[91m' + 'ERROR: Optimization did not succeed!' + '\033[0m')
+         sys.exit(1)
+ 
+@@ -925,8 +1023,16 @@ def opt_mintime(reftrack: np.ndarray,
+     # ------------------------------------------------------------------------------------------------------------------
+ 
+     # helper function to extract solution for state variables, control variables, tire forces, time
+-    f_sol = ca.Function('f_sol', [w], [x_opt, u_opt, tf_opt, dt_opt, ax_opt, ay_opt, ec_opt],
+-                        ['w'], ['x_opt', 'u_opt', 'tf_opt', 'dt_opt', 'ax_opt', 'ay_opt', 'ec_opt'])
++    if seg is not None:
++        # open segment: the outputs depend on the parameters too (time on the curvature)
++        f_sol_p = ca.Function('f_sol', [w, P], [x_opt, u_opt, tf_opt, dt_opt, ax_opt, ay_opt, ec_opt],
++                              ['w', 'p'], ['x_opt', 'u_opt', 'tf_opt', 'dt_opt', 'ax_opt', 'ay_opt', 'ec_opt'])
++
++        def f_sol(w_sol):
++            return f_sol_p(w_sol, p_val)
++    else:
++        f_sol = ca.Function('f_sol', [w], [x_opt, u_opt, tf_opt, dt_opt, ax_opt, ay_opt, ec_opt],
++                            ['w'], ['x_opt', 'u_opt', 'tf_opt', 'dt_opt', 'ax_opt', 'ay_opt', 'ec_opt'])
+ 
+     if pars["pwr_params_mintime"]["pwr_behavior"]:
+ 
+@@ -964,6 +1070,13 @@ def opt_mintime(reftrack: np.ndarray,
+     # solution for time
+     t_opt = np.hstack((0.0, np.cumsum(dt_opt)))
+ 
++    if seg is not None:
++        # open segment: states at all N + 1 points, controls and accelerations per interval; nothing is exported
++        return {"success": True, "status": solver.stats()['return_status'],
++                "iterations": solver.stats()['iter_count'], "solve_time": tend - t0, "cached": cached,
++                "s": np.asarray(s_opt), "t": t_opt, "x": x_opt, "u": u_opt,
++                "ax": np.asarray(ax_opt).ravel(), "ay": np.asarray(ay_opt).ravel()}
++
+     # solution for acceleration
+     ax_opt = np.append(ax_opt[-1], ax_opt)
+     ay_opt = np.append(ay_opt[-1], ay_opt)
