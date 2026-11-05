@@ -13,6 +13,7 @@ withheld: share of the time the car was moving without a pose for max_pose_age s
 odom/truth: distance by wheel odometry over true distance; 1.0 = the odometry reports distance correctly.
 """
 import math
+import sys
 import os
 import time
 
@@ -110,6 +111,10 @@ class LocalizationDebug(Node):
         self.odom_path.add(x, y)
 
     def pose_cb(self, msg):
+        if msg.header.frame_id != 'map':
+            self.get_logger().warning(f"pose in frame '{msg.header.frame_id}', not 'map': ignored",
+                                      throttle_duration_sec=5.0)
+            return
         self.pose_t = time.monotonic()
         if self.truth is None:
             return
@@ -142,7 +147,12 @@ class LocalizationDebug(Node):
 
 def main():
     rclpy.init()
-    node = LocalizationDebug()
+    try:
+        node = LocalizationDebug()
+    except RuntimeError as error:   # e.g. no map_to_world.yaml: a message, not a traceback
+        print(f'localization_debug: {error}', file=sys.stderr)
+        rclpy.try_shutdown()
+        sys.exit(1)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
