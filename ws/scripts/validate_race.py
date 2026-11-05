@@ -60,6 +60,11 @@ def arguments(argv=None):
     return args
 
 
+def sim_time():
+    """The stack's clock choice, as common.sh: the bridge's /clock unless USE_SIM_TIME=false."""
+    return os.environ.get('USE_SIM_TIME', 'true').lower() != 'false'
+
+
 class Failure(RuntimeError):
     pass
 
@@ -145,7 +150,11 @@ class RosObserver:
         self.ros, self.obs = rclpy, observations
         # Keep Python's interruption path in charge of cleanup and reporting.
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
-        self.node = rclpy.create_node('race_validation_evaluator')
+        from rclpy.parameter import Parameter
+        # Pose ages against the clock the stack stamps with: the bridge's /clock unless USE_SIM_TIME=false
+        # (as common.sh), so a later host clock correction cannot push every pose out of the age window.
+        self.node = rclpy.create_node('race_validation_evaluator',
+                                      parameter_overrides=[Parameter('use_sim_time', value=sim_time())])
         self.reset_pub = self.node.create_publisher(Bool, '/autodrive/reset_command', 10)
         self.Bool = Bool
         for topic, kind in (('/scan', LaserScan), ('/odom', Odometry), ('/sensors/imu/raw', Imu)):
@@ -290,7 +299,7 @@ def run(args, observer_factory=RosObserver, process_factory=RaceProcess):
             obs.counter_error = None
             command = ['ros2', 'launch', str(Path(__file__).with_name('validation.launch.py')),
                        'track:=' + args.track, 'localizer:=' + args.localizer,
-                       'speed_scale:=' + str(args.speed_scale)]
+                       'speed_scale:=' + str(args.speed_scale), 'use_sim_time:=' + str(sim_time()).lower()]
             report['command'] = command
             process = process_factory(command, dict(os.environ, TRACKS_DIR=str(args.tracks_dir)), log)
             process.start()
