@@ -190,3 +190,10 @@ def test_startup_frame_without_lidar_still_gets_control_reply(bridge):
     initial = dict(FRAME)
     del initial['V1 LIDAR Range Array']
     assert 'V1 Throttle' in bridge.on_frame(initial)
+
+
+def test_startup_frame_without_any_lidar_field_still_gets_control_reply(bridge):
+    initial = dict(FRAME)
+    del initial['V1 LIDAR Range Array']
+    del initial['V1 LIDAR Scan Rate']
+    assert 'V1 Throttle' in bridge.on_frame(initial)

@@ -7,6 +7,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.signals import SignalHandlerOptions
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
@@ -117,6 +118,9 @@ class MAP(Node):
         if not np.isfinite([x,y,speed,*quat]).all() or abs(np.linalg.norm(quat)-1)>.05 or speed<0:
             return self.stop('nonfinite or invalid state')
         if self.last_xy is not None and math.hypot(x-self.last_xy[0],y-self.last_xy[1])>self.max_jump:
+            # Compare later poses with this one: stop() invalidates the input health, so driving resumes
+            # only after the recovery window of consistent samples here, not never (no sim_reset on the car).
+            self.last_xy=(x,y)
             return self.stop('implausible pose jump')
         yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
         rejection=self.health.accept(yaw,(ps,os_),steady_now)
@@ -141,14 +145,18 @@ class MAP(Node):
         self.get_logger().info(f'MAP v={speed:.2f} cmd={command_v:.2f} target={target} L={lookahead:.2f} a={accel:.2f} steer={steer:.3f} error={error:.2f} low_speed={speed<self.lut.speeds[0]} clamp={clamped} saturation={saturated} column={column}',throttle_duration_sec=1.)
 
 def main():
-    rclpy.init()
+    # Handle Ctrl+C ourselves (as pure_pursuit_node): rclpy's default handler shuts ROS down first, so
+    # the stop could never be published and the car would keep its last command
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node=MAP()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node,timeout_sec=.1)
     except KeyboardInterrupt:
         pass
     finally:
-        if rclpy.ok():
-            node.publish()
+        for _ in range(10 if rclpy.ok() else 0):  # 0.5 s of stops, so the adapter brakes
+            node.publish(0.,node.last_steer)
+            time.sleep(.05)
         node.destroy_node()
         rclpy.try_shutdown()
