@@ -25,7 +25,7 @@ def test_async_mapper_native_save(tmp_path):
     env = dict(os.environ, ROS_DOMAIN_ID=domain)
     with (tmp_path / 'launch.log').open('w') as log:
         process = subprocess.Popen(['ros2', 'launch', 'perception', 'slam_mapping.launch.py', 'track:=synthetic',
-                                    'use_sim_time:=false']  # no /clock in this test domain,
+                                    'use_sim_time:=false'],  # no /clock in this test domain
                                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         rclpy.init(domain_id=int(domain))
         driver = rclpy.create_node('synthetic_mapping_sensors')
