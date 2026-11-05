@@ -10,7 +10,10 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>cartographer_ros</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>slam_graph_tools</exec_depend>
   <exec_depend>cartographer_ros_msgs</exec_depend>
   <exec_depend>robot_localization</exec_depend>   <!-- ekf.launch.py -->
   <exec_depend>geometry_msgs</exec_depend>

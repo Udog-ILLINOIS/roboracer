@@ -212,3 +212,18 @@ This stack builds on these open-source projects:
 If this stack helps your work, please cite the projects it builds on, in particular the AutoDRIVE
 simulator ([Samak et al., 2023](https://arxiv.org/abs/2212.05241)) and the TUM minimum-time optimization
 ([Christ et al., 2021](https://doi.org/10.1080/00423114.2019.1704804)).
+
+### Optional SLAM Toolbox mapping
+
+Cartographer stays the default. After rebuilding the Docker image and workspace,
+use a new track name:
+
+```bash
+scripts/map_track.sh slam_toolbox_test --slam-toolbox --wall-follow --laps 2
+```
+
+This saves `map.pgm`, `map.yaml`, native `map.posegraph`/`map.data`, and a final-graph
+mapping trajectory (retaining online poses for diagnostics) before running the existing raceline planner. Existing track
+directories are refused. This is mapping-only: it does not create a Cartographer
+pbstream or change racing/localization. See [the pipeline guide](docs/pipeline.md#optional-slam-toolbox-mapping-milestone-1)
+for setup, manual testing, MCL compatibility, and loop-closure limitations.
