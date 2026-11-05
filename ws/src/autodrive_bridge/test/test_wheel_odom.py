@@ -1,6 +1,8 @@
+import math
 import pytest
 from builtin_interfaces.msg import Time
 from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Float32
 
 from autodrive_bridge.wheel_odom import WheelOdom, reset_jump
 
@@ -37,6 +39,14 @@ def test_reset_jump():
     assert not reset_jump((0.0, 0.0, 0.0), (0.01, 0.1 / R, 0.1 / R), R, 30.0)    # 10 m/s
     # bunched frames: wall-clock stamps 1 ms apart, a normal frame's travel
     assert not reset_jump((0.0, 0.0, 0.0), (0.001, 0.11 / R, 0.11 / R), R, 30.0)
+
+
+def test_sim_steering_feedback_is_radians(node):
+    node.use_imu = False  # exercise the bicycle-model fallback
+    node.steering_cb(Float32(data=0.2))
+    frame(node, 1.0, 0.0)
+    frame(node, 1.1, node.wheelbase)
+    assert node.yaw == pytest.approx(math.tan(0.2))
 
 
 def test_short_drive_reset_not_integrated(node):
