@@ -76,3 +76,17 @@ def test_recorded_hairpin_clock_and_heading_error_stays_stopped():
     bad_yaw=physical_turn+math.radians(-118.77)
     assert guard.accept(bad_yaw,(12.89335,12.89335),.4+dt) is not None
     assert guard.recovering
+
+
+def test_slower_pose_stream_in_a_turn_is_not_a_heading_fault():
+    # Poses every 0.15 s, controller every 0.025 s, 2.5 rad/s: the yaw propagated between two poses
+    # must not be dropped by re-checking the previous pose on every tick.
+    guard=InputHealth()
+    arm(guard)
+    t, yaw, pose_t = .4, 0., .4
+    for tick in range(1, 60):
+        t=.4+tick*.025
+        assert guard.advance(10+t,t,2.5,True) is None
+        if t-pose_t >= .15-1e-9:
+            yaw, pose_t = yaw+2.5*(t-pose_t), t
+        assert guard.accept(yaw,(10+pose_t,10+t),t) is None  # odometry is fresh every tick
