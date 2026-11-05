@@ -30,12 +30,14 @@ class InputHealth:
         self.valid_since = None
         self.valid_count = 0
         self.last_pair = None
+        self.last_accepted = None
 
     def fault(self):
         self.recovering = True
         self.valid_since = None
         self.valid_count = 0
         self.last_pair = None
+        self.last_accepted = None
 
     def advance(self, ros_now, monotonic_now, yaw_rate=0., gyro_fresh=False):
         reason = None
@@ -51,6 +53,10 @@ class InputHealth:
         return reason
 
     def accept(self, yaw, pair, monotonic_now):
+        # The controller ticks faster than poses arrive: an already accepted pose (pair[0] is its stamp)
+        # is not new evidence, and re-seeding from it would drop the yaw propagated since it was taken.
+        if not self.recovering and self.last_accepted is not None and pair[0] == self.last_accepted[0]:
+            return None
         if self.expected_yaw is None:
             self.expected_yaw = yaw
         if self.expected_yaw is not None and abs(angle_delta(yaw,self.expected_yaw)) > self.heading_tolerance:
@@ -67,4 +73,5 @@ class InputHealth:
                 return 'waiting for consistent recovery samples'
             self.recovering = False
         self.expected_yaw = yaw
+        self.last_accepted = pair
         return None

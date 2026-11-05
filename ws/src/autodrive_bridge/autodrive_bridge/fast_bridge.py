@@ -256,9 +256,11 @@ class FastBridge:
             js.position = [float(angle)]
             P[key].publish(js)
 
-        rate = float(d['V1 LIDAR Scan Rate'])
-        if d.get('V1 LIDAR Range Array') and self.new_scan(d['V1 LIDAR Range Array'], enc, rate):
-            self.publish_scan(d['V1 LIDAR Range Array'], rate, stamp)
+        # early sim frames can lack the lidar fields: still reply (control) below, just no scan
+        if d.get('V1 LIDAR Range Array') and d.get('V1 LIDAR Scan Rate') is not None:
+            rate = float(d['V1 LIDAR Scan Rate'])
+            if self.new_scan(d['V1 LIDAR Range Array'], enc, rate):
+                self.publish_scan(d['V1 LIDAR Range Array'], rate, stamp)
 
         if self.publish_camera:
             camera = np.asarray(PILImage.open(BytesIO(base64.b64decode(d['V1 Front Camera Image']))).convert('RGB'))

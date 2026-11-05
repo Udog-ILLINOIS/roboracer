@@ -91,6 +91,14 @@ def test_map_ros_commands_stops_and_recovers():
             assert drives[-1].drive.speed == 0  # implausible pose jump
             publish()
             assert drives[-1].drive.speed > 0
+            publish(x=-.5, duration=.12)
+            assert drives[-1].drive.speed == 0  # a jump that stays (relocalized, no sim_reset) ...
+            publish(x=-.5)
+            assert drives[-1].drive.speed > 0   # ... recovers from the new position, not latched
+            publish(duration=.12)
+            assert drives[-1].drive.speed == 0
+            publish()
+            assert drives[-1].drive.speed > 0
             held = drives[-1].drive.steering_angle
             publish(yaw=math.pi/2+2., duration=.45)
             assert drives[-1].drive.speed == 0
