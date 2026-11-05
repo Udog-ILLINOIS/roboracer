@@ -1,7 +1,8 @@
-# Async mapping only. Wheel odometry supplies odom -> base_link; no /clock in AutoDRIVE.
+# Async mapping only. Wheel odometry supplies odom -> base_link.
+# use_sim_time comes from slam_mapping.launch.py (the bridge's /clock; use_sim_time:=false for wall time),
+# so it is not set here: a node's own parameter file would override the launch's value.
 slam_toolbox:
   ros__parameters:
-    use_sim_time: false
     mode: mapping
     odom_frame: odom
     map_frame: map

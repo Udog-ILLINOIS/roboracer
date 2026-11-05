@@ -7,7 +7,7 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    defaults = {'track': 'test_track_v2', 'localizer': 'mcl', 'speed_scale': '0.3'}
+    defaults = {'track': 'test_track_v2', 'localizer': 'mcl', 'speed_scale': '0.3', 'use_sim_time': 'true'}
     return LaunchDescription([
         *[DeclareLaunchArgument(k, default_value=v) for k, v in defaults.items()],
         GroupAction([

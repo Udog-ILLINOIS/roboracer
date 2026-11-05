@@ -72,7 +72,7 @@ follow_log="$HOME/ws/log/map_track_${name}_${follow_launch%%.*}.log"
 mkdir -p "$(dirname "$log")"
 # Never start a second map -> odom owner or competing controller.
 active_nodes=$(ros2 node list)
-if echo "$active_nodes" | grep -Eq '^/(cartographer_node|slam_toolbox|mcl|localization_gate|pure_pursuit_node|reactive_node|wall_follow_node|disparity_gap_node|teleop_keyboard)$'; then
+if echo "$active_nodes" | grep -Eq '^/(cartographer_node|slam_toolbox|mcl|localization_gate|pure_pursuit_node|map_node|reactive_node|wall_follow_node|disparity_gap_node|teleop_keyboard)$'; then
     echo 'Stop existing mapping, localization and driving nodes before mapping' >&2
     exit 1
 fi
