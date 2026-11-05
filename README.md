@@ -136,6 +136,13 @@ search: the car stops only when the particle cloud itself spreads.
 Parameters: `ws/src/perception/config/mcl.yaml`; `ros2 launch perception mcl.launch.py track:=<name> particles:=2000`.
 Never run it with `localization.launch.py`: both publish `map -> odom`.
 
+To see how far any localizer is from the sim's ground truth, run this next to `race.sh` (it needs
+`tracks/<name>/map_to_world.yaml`; Ctrl-C prints the run's total):
+
+```bash
+ros2 run perception localization_debug --ros-args -p track:=<name>
+```
+
 ### No map
 
 If mapping fails, `ros2 launch control follow_the_gap.launch.py [speed:=1.0]` (alias `ftg`) drives on the
